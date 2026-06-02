@@ -1286,7 +1286,12 @@ def automatizar_ie_con_rit():
 
             time.sleep(0.5)
             debug_formulario_rit(doc, etiqueta=f"[{rit_completo}] antes de Consultar")
-            
+
+            # El aviso "Existe 1 Trámite pendiente..." aparece justo después de
+            # pulsar Consultar, así que hay que tener activo el monitor antes de
+            # ese click para que la confirmación no bloquee el flujo.
+            threading.Thread(target=cerrar_popups_ie_background, daemon=True).start()
+
             for inp in doc.getElementsByTagName("input"):
                 if inp.getAttribute("value") == "Consultar":
                     try:
@@ -1309,7 +1314,6 @@ def automatizar_ie_con_rit():
                 print(f"[{rit_completo}] No se encontro el boton 'Resolucion'.")
                 continue
 
-            threading.Thread(target=cerrar_popups_ie_background, daemon=True).start()
             resolucion_btn.click()
             time.sleep(2.0)
 
