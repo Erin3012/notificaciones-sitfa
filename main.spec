@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
+datas = [('Notifica liq CON RD.doc', '.'), ('Notifica liq sin rd.doc', '.')]
+driver_path = os.path.join(os.getcwd(), 'IEDriverServer.exe')
+if os.path.exists(driver_path):
+    datas.append((driver_path, '.'))
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('Notifica liq CON RD.doc', '.'), ('Notifica liq sin rd.doc', '.')],
-    hiddenimports=[],
+    datas=datas,
+    hiddenimports=['selenium', 'selenium.webdriver', 'selenium.webdriver.ie'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

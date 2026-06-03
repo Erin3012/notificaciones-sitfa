@@ -1,6 +1,7 @@
 ﻿import tkinter as tk
 from tkinter import simpledialog, messagebox, filedialog
 import win32com.client
+import getpass
 import time
 import threading
 import math
@@ -8,10 +9,90 @@ import os
 import sys
 import unicodedata
 import tempfile
+import re
+import socket
+import uuid
+import traceback
+
+try:
+    from selenium import webdriver
+    from selenium.common.exceptions import (
+        NoAlertPresentException,
+        NoSuchWindowException,
+        TimeoutException,
+        WebDriverException,
+    )
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.ie.options import Options as IeOptions
+    from selenium.webdriver.ie.service import Service as IeService
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.select import Select
+    from selenium.webdriver.support.ui import WebDriverWait
+    SELENIUM_IMPORT_ERROR = None
+except Exception as exc:
+    webdriver = None
+    NoAlertPresentException = NoSuchWindowException = TimeoutException = WebDriverException = Exception
+    By = IeOptions = IeService = Select = WebDriverWait = EC = None
+    SELENIUM_IMPORT_ERROR = exc
 
 # Variables globales para las rutas de los documentos de plantilla seleccionados
 ruta_plantilla_con_rd = None
 ruta_plantilla_sin_rd = None
+
+LOGIN_URL = "http://www.familia.pjud/SITFAWEB/jsp/Login/Login.jsp"
+POST_LOGIN_URL = "http://www.familia.pjud/SITFAWEB/MenuLinkAction.do?opMenu=ConsultaRolTramitar&opRol=59"
+
+
+def cargar_dotenv_simple(ruta_archivo=".env"):
+    if not os.path.exists(ruta_archivo):
+        return
+
+    try:
+        with open(ruta_archivo, "r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                clave, valor = line.split("=", 1)
+                clave = clave.strip()
+                valor = valor.strip().strip('"').strip("'")
+                if clave and clave not in os.environ:
+                    os.environ[clave] = valor
+    except Exception as e:
+        print(f"[WARN] No se pudo cargar .env: {e}")
+
+
+cargar_dotenv_simple()
+
+
+FILL_LOGIN_SCRIPT = """
+var form = document.forms["InicioAplicacionForm"];
+if (!form) {
+    throw new Error("No se encontro el formulario InicioAplicacionForm");
+}
+var data = arguments[0] || {};
+function setValue(name, value) {
+    var el = form.elements[name];
+    if (el) {
+        el.value = value || "";
+    }
+}
+setValue("username", data.username);
+setValue("password", data.password);
+setValue("nomequipo", data.machineName);
+setValue("usuequipo", data.windowsUser);
+setValue("ipequipo", data.localIp);
+setValue("MAC_equipo", data.macAddress);
+return true;
+"""
+
+SUBMIT_LOGIN_SCRIPT = """
+var form = document.forms["InicioAplicacionForm"];
+if (!form) {
+    throw new Error("No se encontro el formulario InicioAplicacionForm");
+}
+form.submit();
+"""
 
 def resolver_rutas_plantillas():
     """
@@ -51,6 +132,176 @@ def resolver_rutas_plantillas():
             break
 
     return ruta_con_rd, ruta_sin_rd
+
+
+def get_local_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return "0"
+
+
+def get_mac_address():
+    mac = uuid.getnode()
+    return "-".join(f"{(mac >> shift) & 0xFF:02X}" for shift in range(40, -1, -8))
+
+
+def safe_get(driver, url, timeout=20):
+    debug_login(f"safe_get inicio url={url!r} timeout={timeout}")
+    try:
+        before_url = driver.current_url
+        debug_login(f"safe_get before_url={before_url!r}")
+    except WebDriverException:
+        before_url = ""
+        debug_login("safe_get no pudo leer current_url inicial")
+
+    try:
+        debug_login(f"safe_get intentando driver.get({url!r})")
+        driver.get(url)
+    except WebDriverException as exc:
+        debug_login(f"safe_get driver.get fallo: {exc}")
+        try:
+            debug_login("safe_get intentando execute_script fallback")
+            driver.execute_script(
+                "var targetUrl = arguments[0]; "
+                "window.setTimeout(function() { window.location.href = targetUrl; }, 0); "
+                "return true;",
+                url,
+            )
+        except WebDriverException as exc2:
+            debug_login(f"safe_get fallo execute_script: {exc2}")
+            raise RuntimeError(f"No se pudo iniciar navegacion por JavaScript: {exc2}") from exc2
+
+    deadline = time.time() + timeout
+    last_url = ""
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            current_url = driver.current_url
+            debug_login(f"safe_get current_url={current_url!r}")
+            if current_url != last_url:
+                last_url = current_url
+            if current_url and current_url != "about:blank" and current_url != before_url:
+                debug_login("safe_get navegacion completada")
+                return
+        except WebDriverException:
+            debug_login("safe_get current_url lanzo WebDriverException")
+            pass
+
+    debug_login("safe_get termino por timeout")
+
+
+def wait_for_ready(driver, timeout=20):
+    debug_login(f"wait_for_ready inicio timeout={timeout}")
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda current: current.execute_script("return document.readyState") in {"interactive", "complete"}
+        )
+        debug_login("wait_for_ready completo")
+    except TimeoutException:
+        debug_login("wait_for_ready timeout")
+        pass
+    except WebDriverException as exc:
+        debug_login(f"wait_for_ready WebDriverException: {exc}")
+        raise
+
+
+def wait_for_form(driver, form_name, timeout=20):
+    debug_login(f"wait_for_form inicio form={form_name!r} timeout={timeout}")
+    WebDriverWait(driver, timeout).until(
+        lambda current: current.execute_script(
+            "return !!document.forms[arguments[0]];",
+            form_name,
+        )
+    )
+    debug_login(f"wait_for_form encontrado form={form_name!r}")
+
+
+def switch_to_frame_with_form(driver, form_name, timeout=20):
+    debug_login(f"switch_to_frame_with_form inicio form={form_name!r} timeout={timeout}")
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        driver.switch_to.default_content()
+        try:
+            if driver.execute_script("return !!document.forms[arguments[0]];", form_name):
+                debug_login(f"switch_to_frame_with_form encontrado en documento principal form={form_name!r}")
+                return
+        except WebDriverException:
+            pass
+
+        frames = driver.find_elements(By.TAG_NAME, "frame") + driver.find_elements(By.TAG_NAME, "iframe")
+        for frame in frames:
+            driver.switch_to.default_content()
+            try:
+                driver.switch_to.frame(frame)
+                if driver.execute_script("return !!document.forms[arguments[0]];", form_name):
+                    debug_login(f"switch_to_frame_with_form encontrado en frame={getattr(frame, 'get_attribute', lambda *_: '')('name')!r}")
+                    return
+            except WebDriverException:
+                continue
+
+        time.sleep(0.5)
+
+    driver.switch_to.default_content()
+    debug_login(f"switch_to_frame_with_form no encontro form={form_name!r}")
+    raise TimeoutException(f"No encontre el formulario {form_name}.")
+
+
+def wait_for_query_form_inputs(driver, timeout=20):
+    WebDriverWait(driver, timeout).until(
+        lambda current: current.execute_script(
+            """
+            var form = document.forms["TramitarPpalForm"];
+            if (!form) {
+                return false;
+            }
+            var tip = form.elements["TIP_Causa"];
+            var rol = form.elements["ROL_Causa"];
+            var era = form.elements["ERA_Causa"];
+            return !!(tip && rol && era && tip.options && tip.options.length && era.options && era.options.length);
+            """
+        )
+    )
+
+
+def ensure_query_form_ready(driver, timeout=15):
+    debug_login(f"ensure_query_form_ready inicio timeout={timeout}")
+    try:
+        switch_to_frame_with_form(driver, "TramitarPpalForm", timeout=2)
+        wait_for_query_form_inputs(driver, timeout=min(timeout, 5))
+        debug_login("ensure_query_form_ready reutilizo formulario existente")
+        return "reused"
+    except TimeoutException:
+        debug_login("ensure_query_form_ready no encontro formulario reutilizable, navegando")
+        driver.switch_to.default_content()
+
+    safe_get(driver, POST_LOGIN_URL, timeout=timeout)
+    switch_to_frame_with_form(driver, "TramitarPpalForm", timeout=timeout)
+    wait_for_query_form_inputs(driver, timeout=timeout)
+    debug_login("ensure_query_form_ready completo tras navegacion")
+    return "navigated"
+
+
+def submit_login(driver, username, password):
+    debug_login("submit_login inicio")
+    wait_for_form(driver, "InicioAplicacionForm", timeout=20)
+    debug_login("submit_login formulario listo")
+    data = {
+        "username": username,
+        "password": password,
+        "machineName": socket.gethostname() or "0",
+        "windowsUser": getpass.getuser() or "0",
+        "localIp": get_local_ip(),
+        "macAddress": get_mac_address(),
+    }
+    debug_login("submit_login llenando formulario")
+    driver.execute_script(FILL_LOGIN_SCRIPT, data)
+    debug_login("submit_login enviando formulario")
+    driver.execute_script(SUBMIT_LOGIN_SCRIPT)
+    debug_login("submit_login submit ejecutado")
 
 # Herramientas de control de ventanas
 try:
@@ -928,6 +1179,37 @@ def sanitizar_nombre_archivo(nombre):
     limpio = limpio.strip().rstrip(".")
     return limpio or "documento"
 
+def guardar_word_sin_cerrar(nombre_base_salida):
+    """Guarda el documento Word abierto con el nombre de la causa en la carpeta del proyecto."""
+    global doc_abierto_actual, ruta_temp_actual
+    if not doc_abierto_actual or not ruta_temp_actual:
+        print("    [Word] No hay documento abierto para guardar.")
+        return ""
+
+    try:
+        carpeta_proyecto = os.path.dirname(os.path.abspath(__file__))
+        extension = os.path.splitext(ruta_temp_actual)[1] or ".doc"
+        nombre_archivo = f"{sanitizar_nombre_archivo(nombre_base_salida)}{extension}"
+        ruta_salida = os.path.join(carpeta_proyecto, nombre_archivo)
+
+        if os.path.exists(ruta_salida):
+            try:
+                os.remove(ruta_salida)
+            except Exception as e_rm:
+                print(f"    [Word] No se pudo reemplazar '{ruta_salida}': {e_rm}")
+
+        try:
+            doc_abierto_actual.SaveAs2(ruta_salida)
+        except Exception:
+            doc_abierto_actual.SaveAs(ruta_salida)
+
+        print(f"    [Word] Documento guardado como: {ruta_salida}")
+        return ruta_salida
+    except Exception as e:
+        print(f"    [Word] Error guardando el documento: {e}")
+        return ""
+
+
 def guardar_y_cerrar_word_actual(nombre_base_salida):
     """Guarda el documento Word abierto con un nombre basado en el RIT y lo cierra."""
     global doc_abierto_actual, ruta_temp_actual
@@ -969,11 +1251,10 @@ def guardar_y_cerrar_word_actual(nombre_base_salida):
         return ""
 
 def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucion=None, cuenta_lav=None, ruc_completo=None, total_liquidacion=None):
-    global doc_abierto_actual, ruta_temp_actual
+    global doc_abierto_actual, ruta_temp_actual, ruta_plantilla_con_rd, ruta_plantilla_sin_rd
     import os
     
     try:
-        global ruta_plantilla_con_rd, ruta_plantilla_sin_rd, doc_abierto_actual, ruta_temp_actual
         
         # Determinar quÃ© plantilla usar
         if cuotas >= 3:
@@ -1027,6 +1308,21 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
         time.sleep(0.5)
         doc_abierto_actual = doc_word
         ruta_temp_actual = ruta_doc_a_usar
+        
+        # Debug: mostrar contenido del documento para ver qué marcadores hay
+        try:
+            contenido = doc_word.Content.Text
+            print(f"    [DEBUG] Longitud del documento: {len(contenido)} caracteres")
+            # Buscar patrones << >> en el documento
+            import re
+            marcadores = re.findall(r'<<[^>]+>>', contenido)
+            if marcadores:
+                print(f"    [DEBUG] Marcadores encontrados en la plantilla: {marcadores[:20]}")
+            else:
+                print(f"    [DEBUG] No se encontraron marcadores << >> en la plantilla")
+                print(f"    [DEBUG] Primeros 500 caracteres del documento: {contenido[:500]}")
+        except Exception as e:
+            print(f"    [DEBUG] Error leyendo contenido del documento: {e}")
                 
         # --- REEMPLAZO DE VARIABLES ---
         print("\n--- INICIANDO REEMPLAZO EN WORD ---")
@@ -1180,6 +1476,1101 @@ def leer_excel_causas(ruta_archivo):
         print(f"Error al leer Excel: {e}")
     return datos
 
+
+BROWSER_BACKEND = os.environ.get("SITFA_BROWSER_BACKEND", "selenium_ie_mode").strip().lower()
+SITFA_URL = os.environ.get("SITFA_URL", "").strip()
+SITFA_USER = os.environ.get("SITFA_USER", "").strip()
+SITFA_PASSWORD = os.environ.get("SITFA_PASSWORD", "").strip()
+SITFA_IE_MODE = os.environ.get("SITFA_IE_MODE", "edge").strip().lower()
+SITFA_DEBUG_LOGIN = os.environ.get("SITFA_DEBUG_LOGIN", "1").strip() not in {"0", "false", "no"}
+
+
+def debug_login(message):
+    if SITFA_DEBUG_LOGIN:
+        print(f"[LOGIN DEBUG] {message}")
+
+
+def resolver_msedge_path():
+    candidatos = [
+        os.environ.get("EDGE_PATH", "").strip(),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for ruta in candidatos:
+        if ruta and os.path.exists(ruta):
+            return ruta
+    return ""
+
+
+def resolver_iedriver_path():
+    candidatos_base = []
+    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else ""
+    if exe_dir:
+        candidatos_base.append(exe_dir)
+
+    meipass_dir = getattr(sys, "_MEIPASS", None)
+    if meipass_dir:
+        candidatos_base.append(meipass_dir)
+
+    candidatos_base.append(os.path.dirname(os.path.abspath(__file__)))
+
+    candidatos = []
+    ruta_env = os.environ.get("IEDRIVER_PATH", "").strip()
+    if ruta_env:
+        candidatos.append(ruta_env)
+
+    for base_dir in candidatos_base:
+        candidatos.append(os.path.join(base_dir, "IEDriverServer.exe"))
+        candidatos.append(os.path.join(base_dir, "drivers", "IEDriverServer.exe"))
+
+    for ruta in candidatos:
+        if ruta and os.path.exists(ruta):
+            return ruta
+    return ""
+
+
+def iniciar_driver_selenium_edge_ie(root):
+    if not webdriver:
+        raise RuntimeError(f"Selenium no esta disponible: {SELENIUM_IMPORT_ERROR}")
+
+    debug_login("iniciar_driver_selenium_edge_ie inicio")
+    debug_login(f"edge_path={resolver_msedge_path()!r}")
+    debug_login(f"driver_path={resolver_iedriver_path()!r}")
+    debug_login(f"SITFA_IE_MODE={SITFA_IE_MODE!r}")
+
+    edge_path = resolver_msedge_path()
+    if not edge_path:
+        raise RuntimeError("No se encontro msedge.exe. Configura EDGE_PATH o instala Microsoft Edge.")
+
+    driver_path = resolver_iedriver_path()
+    if not driver_path:
+        raise RuntimeError(
+            "No se encontro IEDriverServer.exe. Colocalo junto al ejecutable/script o configura IEDRIVER_PATH."
+        )
+
+    options = IeOptions()
+    options.page_load_strategy = os.environ.get("SITFA_PAGE_LOAD_STRATEGY", "eager")
+    options.initial_browser_url = SITFA_URL or LOGIN_URL
+    options.attach_to_edge_chrome = True
+    if SITFA_IE_MODE != "ie":
+        options.edge_executable_path = edge_path
+    options.ignore_protected_mode_settings = True
+    options.ignore_zoom_level = True
+    options.ensure_clean_session = False
+    options.require_window_focus = True
+    options.native_events = False
+
+    service = IeService(executable_path=driver_path)
+    debug_login("creando webdriver.Ie")
+    driver = webdriver.Ie(service=service, options=options)
+    debug_login("webdriver.Ie creado")
+    driver.set_page_load_timeout(10)
+
+    return driver
+
+
+def selenium_find_first(driver, selectors, timeout=5):
+    fin = time.time() + timeout
+    while time.time() < fin:
+        for by, value in selectors:
+            try:
+                elementos = driver.find_elements(by, value)
+                visibles = [el for el in elementos if el.is_displayed()]
+                if visibles:
+                    return visibles[0]
+                if elementos:
+                    return elementos[0]
+            except Exception:
+                continue
+        time.sleep(0.2)
+    return None
+
+
+def selenium_set_input(driver, element, value):
+    try:
+        element.clear()
+    except Exception:
+        pass
+    try:
+        element.send_keys(value)
+        return True
+    except Exception:
+        try:
+            driver.execute_script(
+                """
+                arguments[0].focus();
+                arguments[0].value = arguments[1];
+                try {
+                    if (arguments[0].fireEvent) {
+                        arguments[0].fireEvent('onchange');
+                        arguments[0].fireEvent('onblur');
+                    } else if (document.createEvent) {
+                        var evt = document.createEvent('HTMLEvents');
+                        evt.initEvent('change', true, false);
+                        arguments[0].dispatchEvent(evt);
+                        var evt2 = document.createEvent('HTMLEvents');
+                        evt2.initEvent('input', true, false);
+                        arguments[0].dispatchEvent(evt2);
+                    } else if (document.createEventObject) {
+                        var evt3 = document.createEventObject();
+                        arguments[0].fireEvent('onchange', evt3);
+                        arguments[0].fireEvent('onblur', evt3);
+                    }
+                } catch(e) {}
+                arguments[0].blur();
+                """,
+                element,
+                value,
+            )
+            return True
+        except Exception:
+            return False
+
+
+def intentar_login_sitfa(driver):
+    if not (SITFA_USER and SITFA_PASSWORD):
+        debug_login("intentar_login_sitfa sin credenciales")
+        return False
+
+    debug_login("intentar_login_sitfa inicio")
+    try:
+        debug_login(f"estado inicial url={driver.current_url!r} title={driver.title!r}")
+        debug_login(f"window_handles={getattr(driver, 'window_handles', [])!r}")
+    except Exception as exc:
+        debug_login(f"no se pudo leer estado inicial: {exc}")
+
+    for step in range(20):
+        try:
+            debug_login(f"esperando login form paso={step + 1}/20")
+            wait_for_ready(driver, timeout=1)
+            if driver.execute_script("return !!document.forms['InicioAplicacionForm'];"):
+                debug_login("formulario de login detectado")
+                break
+        except Exception as exc:
+            debug_login(f"espera login form fallo en paso {step + 1}: {exc}")
+        time.sleep(0.5)
+    else:
+        debug_login("no se detecto el formulario de login luego de esperar")
+        return False
+
+    try:
+        debug_login("enviando submit_login")
+        submit_login(driver, SITFA_USER, SITFA_PASSWORD)
+    except Exception as exc:
+        print(f"[WARN] No se pudo enviar el login automatico: {exc}")
+        debug_login(f"error en submit_login: {exc}\n{traceback.format_exc()}")
+        return False
+
+    wait_for_ready(driver, timeout=10)
+    try:
+        debug_login(f"abriendo POST_LOGIN_URL={POST_LOGIN_URL!r}")
+        safe_get(driver, POST_LOGIN_URL, timeout=10)
+    except Exception as exc:
+        debug_login(f"fallo safe_get POST_LOGIN_URL: {exc}")
+        pass
+    wait_for_ready(driver, timeout=8)
+    try:
+        debug_login(f"login final url={driver.current_url!r} title={driver.title!r}")
+        debug_login(f"window_handles={getattr(driver, 'window_handles', [])!r}")
+    except Exception as exc:
+        debug_login(f"no se pudo leer estado final: {exc}")
+    debug_login("intentar_login_sitfa completo")
+    return True
+
+
+def selenium_wait_document_ready(driver, timeout=10):
+    fin = time.time() + timeout
+    while time.time() < fin:
+        try:
+            estado = driver.execute_script("return document.readyState")
+            if estado in ("interactive", "complete"):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def selenium_list_frame_candidates(driver):
+    driver.switch_to.default_content()
+    frames = []
+    for tag in ("frame", "iframe"):
+        try:
+            frames.extend(driver.find_elements(By.TAG_NAME, tag))
+        except Exception:
+            continue
+
+    def prioridad(frame):
+        try:
+            nombre = (frame.get_attribute("name") or "").strip().lower()
+        except Exception:
+            nombre = ""
+        return 0 if nombre == "body" else 1
+
+    try:
+        frames.sort(key=prioridad)
+    except Exception:
+        pass
+    return [None] + frames
+
+
+def selenium_run_in_contexts(driver, callback):
+    ultimo_error = None
+    for frame in selenium_list_frame_candidates(driver):
+        try:
+            driver.switch_to.default_content()
+            if frame is not None:
+                driver.switch_to.frame(frame)
+            resultado = callback()
+            if resultado:
+                return resultado
+        except Exception as exc:
+            ultimo_error = exc
+            continue
+    if ultimo_error:
+        print(f"    [DEBUG] Selenium contexto sin resultado: {ultimo_error}")
+    return None
+
+
+def selenium_find_elements_by_name(driver, nombre):
+    def _buscar():
+        elementos = driver.find_elements(By.NAME, nombre)
+        return elementos if elementos else None
+
+    return selenium_run_in_contexts(driver, _buscar) or []
+
+
+def selenium_form_field_value(driver, nombre_campo, valor=None):
+    def _operar():
+        script = """
+        var form = document.forms['TramitarPpalForm'] || document.querySelector("form[name='TramitarPpalForm']");
+        if (!form) return null;
+        var el = form.elements ? form.elements[arguments[0]] : null;
+        if (!el && form[arguments[0]]) el = form[arguments[0]];
+        if (!el) {
+            var candidatos = form.getElementsByTagName ? form.getElementsByTagName('*') : [];
+            for (var i = 0; i < candidatos.length; i++) {
+                var cand = candidatos[i];
+                var candName = cand.name || cand.id || '';
+                if (candName === arguments[0]) {
+                    el = cand;
+                    break;
+                }
+            }
+        }
+        if (!el) return null;
+        if (arguments.length > 1) {
+            try { el.value = arguments[1]; } catch(e) {}
+            try { el.setAttribute('value', arguments[1]); } catch(e) {}
+            try {
+                if (el.fireEvent) {
+                    el.fireEvent('onchange');
+                    el.fireEvent('onblur');
+                }
+            } catch(e) {}
+        }
+        try {
+            return el.value != null ? String(el.value) : '';
+        } catch(e) {
+            return '';
+        }
+        """
+        if valor is None:
+            return driver.execute_script(script, nombre_campo)
+        return driver.execute_script(script, nombre_campo, str(valor))
+
+    return selenium_run_in_contexts(driver, _operar)
+
+
+def selenium_set_field_value(driver, nombre_campo, valor):
+    try:
+        return str(selenium_form_field_value(driver, nombre_campo, valor) or "") == str(valor)
+    except Exception:
+        return False
+
+
+def selenium_read_field_value(driver, nombre_campo):
+    try:
+        return selenium_form_field_value(driver, nombre_campo)
+    except Exception:
+        return None
+
+
+def debug_formulario_rit_selenium(driver, etiqueta=""):
+    try:
+        tip = selenium_read_field_value(driver, "TIP_Causa")
+        rol = selenium_read_field_value(driver, "ROL_Causa")
+        era = selenium_read_field_value(driver, "ERA_Causa")
+        print(f"    [DEBUG] {etiqueta} TIP_Causa={tip!r} ROL_Causa={rol!r} ERA_Causa={era!r}")
+    except Exception as e:
+        print(f"    [DEBUG] Error en debug_formulario_rit_selenium: {e}")
+
+
+def selenium_find_element_by_text(driver, textos_objetivo, tags=("input", "button", "a"), timeout=25, pausa=0.5):
+    import json
+    objetivos = [normalizar_texto(t) for t in textos_objetivo if normalizar_texto(t)]
+    if not objetivos:
+        return None
+    fin = time.time() + timeout
+
+    SCRIPT_FIND_BY_TEXT = """
+    var textos = arguments[0];
+    var tags = arguments[1];
+    function normalizar(valor) {
+        return (valor || '').toLowerCase();
+    }
+    for (var t = 0; t < tags.length; t++) {
+        var elements = document.getElementsByTagName(tags[t]);
+        for (var i = 0; i < elements.length; i++) {
+            var el = elements[i];
+            var attrs = [
+                el.value || '',
+                el.textContent || '',
+                el.title || '',
+                el.alt || '',
+                el.name || '',
+                el.innerText || ''
+            ].join(' ');
+            var texto = normalizar(attrs);
+            for (var j = 0; j < textos.length; j++) {
+                if (texto.indexOf(textos[j]) >= 0) {
+                    return i + '|' + tags[t];
+                }
+            }
+        }
+    }
+    return '';
+    """
+
+    def _buscar_en_contexto():
+        try:
+            selenium_wait_document_ready(driver, timeout=2)
+        except Exception:
+            pass
+        resultado = driver.execute_script(SCRIPT_FIND_BY_TEXT, objetivos, list(tags))
+        if resultado:
+            idx_str, tag = resultado.split("|", 1)
+            idx = int(idx_str)
+            elementos = driver.find_elements(By.TAG_NAME, tag)
+            if idx < len(elementos):
+                return elementos[idx]
+        return None
+
+    while time.time() < fin:
+        try:
+            elemento = selenium_run_in_contexts(driver, _buscar_en_contexto)
+            if elemento:
+                return elemento
+        except Exception as e:
+            print(f"    [DEBUG] Error en selenium_find_element_by_text: {e}")
+        time.sleep(pausa)
+    return None
+
+
+def selenium_click_element(driver, element):
+    try:
+        driver.execute_script("arguments[0].click();", element)
+        return True
+    except Exception:
+        pass
+    try:
+        element.click()
+        return True
+    except Exception:
+        pass
+
+    def _click_en_contexto():
+        try:
+            driver.execute_script("arguments[0].click();", element)
+            return True
+        except Exception:
+            pass
+        try:
+            element.click()
+            return True
+        except Exception:
+            return None
+
+    resultado = selenium_run_in_contexts(driver, _click_en_contexto)
+    return bool(resultado)
+
+
+def selenium_accept_alerts(driver, timeout=6):
+    fin = time.time() + timeout
+    acepto = False
+    while time.time() < fin:
+        try:
+            alerta = driver.switch_to.alert
+            texto = alerta.text
+            print(f"    [DEBUG] Alerta detectada: {texto}")
+            alerta.accept()
+            acepto = True
+            time.sleep(0.3)
+        except NoAlertPresentException:
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"    [DEBUG] Error aceptando alerta Selenium: {e}")
+            time.sleep(0.2)
+    return acepto
+
+
+def selenium_extraer_ruc(driver):
+    patron = re.compile(r"\b\d{1,2}\s*-\s*\d\s*-\s*\d{6,8}-[0-9Kk]\b|\b\d{1,2}\.\d{3}\.\d{3}-[0-9Kk]\b|\b\d{8,9}-[0-9Kk]\b")
+
+    def _buscar():
+        textos = []
+        try:
+            body_text = driver.execute_script("return document.body ? document.body.innerText || '' : '';")
+            if body_text:
+                textos.append(str(body_text))
+        except Exception:
+            pass
+        try:
+            valores = driver.execute_script(
+                """
+                return Array.from(document.querySelectorAll('input')).map(function(el) {
+                    return [el.value || '', el.id || '', el.name || ''].join(' ');
+                });
+                """
+            )
+            textos.extend(valores or [])
+        except Exception:
+            pass
+        try:
+            celdas = driver.execute_script(
+                "return Array.from(document.querySelectorAll('td')).map(function(el) { return el.innerText || ''; });"
+            )
+            textos.extend(celdas or [])
+        except Exception:
+            pass
+
+        for texto in textos:
+            m = patron.search(str(texto))
+            if m:
+                return m.group(0).replace(" ", "").upper()
+        return None
+
+    return selenium_run_in_contexts(driver, _buscar) or ""
+
+
+def selenium_obtener_info_liquidacion(driver):
+    def _buscar():
+        return driver.execute_script(
+            """
+            function normalizar(valor) {
+                return (valor || '').toLowerCase()
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '');
+            }
+            const tds = Array.from(document.querySelectorAll('td.texto, td'));
+            for (const td of tds) {
+                const texto = normalizar(td.innerText || '');
+                if (!texto.includes('liquidacion de deuda')) {
+                    continue;
+                }
+                const tr = td.closest('tr');
+                if (!tr) {
+                    continue;
+                }
+                const celdas = Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim());
+                const checkbox = tr.querySelector('input[type="checkbox"]');
+                if (checkbox) {
+                    checkbox.click();
+                }
+                return {
+                    id_escrito: checkbox ? (checkbox.value || '') : '',
+                    folio: celdas[0] || '',
+                    fecha: celdas[4] || '',
+                    celdas: celdas
+                };
+            }
+            return null;
+            """
+        )
+
+    return selenium_run_in_contexts(driver, _buscar) or {}
+
+
+def selenium_clicar_pdf_liquidacion(driver, id_escrito, reintentos=12, pausa=0.5):
+    if not id_escrito:
+        return False
+
+    script = """
+    var id_escrito = arguments[0];
+    var imagenes = document.getElementsByTagName("img");
+    for (var i = 0; i < imagenes.length; i++) {
+        var img = imagenes[i];
+        var src = (img.src || '').toLowerCase();
+        var onclick = img.getAttribute("onclick") || '';
+        if (src.indexOf('generarpdf.gif') >= 0 && onclick.indexOf(id_escrito) >= 0) {
+            try { img.click(); } catch(e) {}
+            return true;
+        }
+    }
+    return false;
+    """
+
+    for intento in range(1, reintentos + 1):
+        print(f"    [PDF] Intento {intento}: buscando imagenes para id '{id_escrito}'.")
+        try:
+            if driver.execute_script(script, id_escrito):
+                print(f"    [PDF] Click realizado sobre generarpdf.gif para id '{id_escrito}'.")
+                return True
+        except Exception as e:
+            print(f"    [PDF] Error en intento {intento}: {e}")
+        time.sleep(pausa)
+
+    print(f"    [PDF] No se encontro el boton de PDF para id '{id_escrito}'.")
+    return False
+
+
+def selenium_click_radio_grales(driver):
+    try:
+        return bool(driver.execute_script("""
+            var radios = document.querySelectorAll("input[name='seleccion']");
+            for (var i = 0; i < radios.length; i++) {
+                if (radios[i].value === 'Grales') {
+                    radios[i].click();
+                    return true;
+                }
+            }
+            return false;
+        """))
+    except Exception:
+        return False
+
+
+def selenium_agregar_nomenclatura(driver, valor_nomenclatura):
+    script = """
+    var select = document.querySelector("select[name='cmbNomenclaturas'], [name='cmbNomenclaturas']");
+    if (!select) return false;
+    select.value = arguments[0];
+    var event = document.createEvent('HTMLEvents');
+    event.initEvent('change', true, false);
+    select.dispatchEvent(event);
+    var btn = document.querySelector("[name='BtnAgregarNomenclatura']");
+    if (btn) {
+        try { btn.click(); } catch(e) {}
+        return true;
+    }
+    return false;
+    """
+    try:
+        return bool(driver.execute_script(script, str(valor_nomenclatura)))
+    except Exception:
+        return False
+
+
+def selenium_seleccionar_juez(driver, apellido_juez):
+    if not apellido_juez:
+        return False
+    script = """
+    var select = document.querySelector("select[name='CRR_IdFuncionarioTrmPend'], [name='CRR_IdFuncionarioTrmPend']");
+    if (!select) return false;
+    var apellido = arguments[0].toLowerCase();
+    for (var i = 0; i < select.options.length; i++) {
+        if ((select.options[i].text || '').toLowerCase().indexOf(apellido) >= 0) {
+            select.value = select.options[i].value;
+            try {
+                var event = document.createEvent('HTMLEvents');
+                event.initEvent('change', true, false);
+                select.dispatchEvent(event);
+            } catch(e) {}
+            return true;
+        }
+    }
+    return false;
+    """
+    try:
+        return bool(driver.execute_script(script, apellido_juez))
+    except Exception:
+        return False
+
+
+def selenium_set_glosa(driver, texto_final):
+    try:
+        return bool(driver.execute_script("""
+            var campo = document.getElementById('GLS_Ref');
+            if (!campo) {
+                var refs = document.getElementsByName('referencia');
+                if (refs.length > 0) campo = refs[0];
+            }
+            if (!campo) return false;
+            campo.focus();
+            campo.value = arguments[0];
+            try {
+                if (campo.fireEvent) {
+                    campo.fireEvent('onchange');
+                    campo.fireEvent('onblur');
+                } else if (document.createEvent) {
+                    var evt = document.createEvent('HTMLEvents');
+                    evt.initEvent('change', true, false);
+                    campo.dispatchEvent(evt);
+                    var evt2 = document.createEvent('HTMLEvents');
+                    evt2.initEvent('input', true, false);
+                    campo.dispatchEvent(evt2);
+                } else if (document.createEventObject) {
+                    var evt3 = document.createEventObject();
+                    campo.fireEvent('onchange', evt3);
+                    campo.fireEvent('onblur', evt3);
+                }
+            } catch(e) {}
+            campo.blur();
+            return true;
+        """, texto_final))
+    except Exception:
+        return False
+
+
+def selenium_click_actuacion(driver):
+    script = """
+    var elements = document.querySelectorAll("input[name='irAccionTramitarT'], button[name='irAccionTramitarT']");
+    if (!elements.length) return false;
+    for (var i = 0; i < elements.length; i++) {
+        var el = elements[i];
+        var text = (el.value || '') + ' ' + (el.innerText || '') + ' ' + (el.textContent || '') + ' ' + (el.name || '');
+        if (text.toLowerCase().indexOf('actu') >= 0) {
+            var form = el.form || document.forms['TramitarPpalForm'];
+            if (form && form.elements['FLG_Actuacion']) {
+                try { form.elements['FLG_Actuacion'].value = '1'; } catch(e) {}
+            }
+            try { el.removeAttribute('disabled'); } catch(e) {}
+            try { el.disabled = false; } catch(e) {}
+            try { el.scrollIntoView(true); } catch(e) {}
+            try { el.click(); } catch(e) {}
+            return true;
+        }
+    }
+    return false;
+    """
+    try:
+        return bool(driver.execute_script(script))
+    except Exception as exc:
+        debug_login(f"selenium_click_actuacion fallo: {exc}")
+        return False
+
+
+def selenium_override_show_modal_dialog(driver):
+    try:
+        driver.execute_script(
+            "window.showModalDialog = function(url, arg, opt) { window.open(url, '_blank'); return 'mock'; };"
+        )
+        return True
+    except Exception:
+        return False
+
+
+def selenium_wait_new_window(driver, handles_previos, timeout=10):
+    fin = time.time() + timeout
+    previos = set(handles_previos)
+    while time.time() < fin:
+        try:
+            actuales = driver.window_handles
+            nuevos = [h for h in actuales if h not in previos]
+            if nuevos:
+                return nuevos[-1]
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return ""
+
+
+def selenium_extraer_litigantes_popup(driver):
+    datos_litigantes = []
+
+    def _extraer():
+        tabla = driver.execute_script(
+            """
+            let tabla = document.getElementById('TablaLitigantes');
+            if (!tabla) {
+                tabla = Array.from(document.querySelectorAll('table')).find(function(tbl) {
+                    return (tbl.id || '').toLowerCase() === 'tablalitigantes';
+                }) || null;
+            }
+            if (!tabla) {
+                return null;
+            }
+            return Array.from(tabla.querySelectorAll('tr')).map(function(tr) {
+                return Array.from(tr.querySelectorAll('td')).map(function(td) {
+                    return (td.innerText || '').trim();
+                });
+            });
+            """
+        )
+
+        if not tabla:
+            return None
+
+        encontrados = []
+        for celdas in tabla:
+            if len(celdas) < 6:
+                continue
+            sujeto = (celdas[2] or "").upper()
+            rut = celdas[3] or ""
+            nombre = (celdas[5] or "").replace("\r\n", " ").replace("\n", " ").strip()
+            sujeto_limpio = sujeto.replace(".", "").strip()
+            if any(s in sujeto for s in ["DTE", "DDO", "ADOLESCENTE", "NIÑA", "NIÑO", "NNA", "SOLICITANTE"]):
+                if rut and not any(x["rut"] == rut for x in encontrados):
+                    encontrados.append({"sujeto": sujeto_limpio, "rut": rut, "nombre": nombre})
+
+        if encontrados:
+            return encontrados
+
+        for celdas in tabla:
+            if len(celdas) < 4:
+                continue
+            candidato_sujeto = " ".join([celdas[i] for i in (2, 4, 5) if len(celdas) > i and celdas[i]])
+            sujeto_norm = normalizar_texto(candidato_sujeto)
+            if not any(s in sujeto_norm for s in ["dte", "ddo", "adolescente", "nina", "nino", "nna", "solicitante"]):
+                continue
+            rut = celdas[3] if len(celdas) > 3 else ""
+            nombre = (celdas[5] if len(celdas) > 5 else "").replace("\r\n", " ").replace("\n", " ").strip()
+            if rut and not any(x["rut"] == rut for x in encontrados):
+                encontrados.append({
+                    "sujeto": candidato_sujeto.replace(".", "").strip().upper(),
+                    "rut": rut,
+                    "nombre": nombre,
+                })
+
+        return encontrados if encontrados else None
+
+    resultado = selenium_run_in_contexts(driver, _extraer)
+    if resultado:
+        datos_litigantes.extend(resultado)
+    return datos_litigantes
+
+
+def selenium_ir_al_buscador(driver):
+    script = """
+    var links = document.querySelectorAll('a');
+    for (var i = 0; i < links.length; i++) {
+        var href = links[i].href || '';
+        var text = (links[i].innerText || '').toLowerCase();
+        if (text.indexOf('volver al buscador') >= 0 || text.indexOf('consulta rol tramitar') >= 0 || href.indexOf('opMenu=ConsultaRolTramitar') >= 0) {
+            try { links[i].click(); } catch(e) {}
+            return true;
+        }
+    }
+    return false;
+    """
+    try:
+        return bool(driver.execute_script(script))
+    except Exception:
+        return False
+
+
+def automatizar_selenium_edge_ie_con_rit():
+    root = tk.Tk()
+    root.withdraw()
+
+    archivo_excel = filedialog.askopenfilename(title="Selecciona el archivo Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
+    if not archivo_excel:
+        return
+
+    carpeta_pdfs = filedialog.askdirectory(title="Selecciona la carpeta donde se descargara el PDF")
+    if not carpeta_pdfs:
+        messagebox.showinfo("Cancelado", "No se selecciono una carpeta para los PDF. Proceso terminado.")
+        return
+
+    global ruta_plantilla_con_rd, ruta_plantilla_sin_rd
+
+    ruta_plantilla_con_rd, ruta_plantilla_sin_rd = resolver_rutas_plantillas()
+
+    if not ruta_plantilla_con_rd:
+        ruta_plantilla_con_rd = filedialog.askopenfilename(
+            title="Selecciona la plantilla Word 'Notifica liq CON RD.doc'",
+            filetypes=[("Word Documents", "*.doc *.docx")]
+        )
+        if not ruta_plantilla_con_rd:
+            messagebox.showinfo("Cancelado", "Seleccion de plantilla 'con RD' cancelada. Proceso terminado.")
+            return
+
+    if not ruta_plantilla_sin_rd:
+        ruta_plantilla_sin_rd = filedialog.askopenfilename(
+            title="Selecciona la plantilla Word 'Notifica liq sin rd.doc'",
+            filetypes=[("Word Documents", "*.doc *.docx")]
+        )
+        if not ruta_plantilla_sin_rd:
+            messagebox.showinfo("Cancelado", "Seleccion de plantilla 'sin RD' cancelada. Proceso terminado.")
+            return
+
+    causas = leer_excel_causas(archivo_excel)
+    if not causas:
+        messagebox.showerror("Error", "No se encontraron datos en el Excel.")
+        return
+
+    driver = None
+    try:
+        driver = iniciar_driver_selenium_edge_ie(root)
+        login_intentado = intentar_login_sitfa(driver)
+        if login_intentado:
+            print("    [DEBUG] Se intento login automatico con credenciales de .env.")
+        else:
+            print("    [DEBUG] No se detecto formulario de login automatico; se mantiene flujo asistido.")
+
+        try:
+            estado_form = ensure_query_form_ready(driver, timeout=15)
+            print(f"    [DEBUG] Formulario de consulta preparado con modo: {estado_form}")
+        except Exception as exc:
+            print(f"    [WARN] No se pudo preparar el formulario de consulta automaticamente: {exc}")
+
+        for index, item in enumerate(causas):
+            rit_completo = item["rit"]
+            apellido_juez = item["juez"].lower()
+
+            limpiar_pdfs_en_carpeta(carpeta_pdfs)
+
+            try:
+                p = rit_completo.split("-")
+                tipo_causa, rit_num, anio_causa = p[0].strip().upper(), p[1].strip(), p[2].strip()
+            except Exception as e:
+                print(f"[{rit_completo}] Error al separar RIT: {e}")
+                continue
+
+            try:
+                if not selenium_set_field_value(driver, "TIP_Causa", tipo_causa):
+                    print(f"[{rit_completo}] No se pudo cargar TIP_Causa.")
+                    continue
+                if not selenium_set_field_value(driver, "ERA_Causa", anio_causa):
+                    print(f"[{rit_completo}] No se pudo cargar ERA_Causa.")
+                    continue
+                if not selenium_set_field_value(driver, "ROL_Causa", rit_num):
+                    print(f"[{rit_completo}] No se pudo cargar ROL_Causa.")
+                    continue
+
+                time.sleep(1.5)
+
+                debug_formulario_rit_selenium(driver, etiqueta=f"[{rit_completo}] antes de Consultar")
+
+                btn_consultar = selenium_find_element_by_text(driver, ["Consultar"], tags=("input", "button"), timeout=10)
+                if not btn_consultar:
+                    print(f"[{rit_completo}] No se encontro el boton 'Consultar'.")
+                    continue
+
+                if not selenium_click_element(driver, btn_consultar):
+                    print(f"[{rit_completo}] No se pudo pulsar 'Consultar'.")
+                    continue
+
+                time.sleep(1.0)
+                selenium_accept_alerts(driver, timeout=6)
+                time.sleep(1.0)
+
+                driver.switch_to.default_content()
+                try:
+                    selenium_wait_document_ready(driver, timeout=10)
+                except Exception:
+                    pass
+
+                print(f"    [DEBUG] [{rit_completo}] Buscando pestaña Liquidacion...")
+                tab_liquidacion = selenium_find_element_by_text(
+                    driver,
+                    ["Liquidación", "Liquidacion"],
+                    tags=("a", "td", "div", "span"),
+                    timeout=10,
+                    pausa=0.5,
+                )
+                if tab_liquidacion:
+                    print(f"    [DEBUG] [{rit_completo}] Click en pestaña Liquidacion")
+                    selenium_click_element(driver, tab_liquidacion)
+                    time.sleep(2.0)
+                    driver.switch_to.default_content()
+                    try:
+                        selenium_wait_document_ready(driver, timeout=10)
+                    except Exception:
+                        pass
+
+                print(f"    [DEBUG] [{rit_completo}] Buscando boton Resolucion...")
+                resolucion_btn = selenium_find_element_by_text(
+                    driver,
+                    ["Resolución", "Resolucion"],
+                    timeout=25,
+                    pausa=0.5,
+                )
+                if not resolucion_btn:
+                    print(f"[{rit_completo}] No se encontro el boton 'Resolucion'.")
+                    try:
+                        page_text = driver.execute_script("return document.body ? document.body.innerText.substring(0, 500) : '';")
+                        print(f"    [DEBUG] Contenido parcial de la pagina: {page_text[:200]}")
+                    except Exception as e:
+                        print(f"    [DEBUG] No se pudo obtener contenido de la pagina: {e}")
+                    continue
+
+                print(f"    [DEBUG] Boton Resolucion encontrado")
+                if not selenium_click_element(driver, resolucion_btn):
+                    print(f"[{rit_completo}] No se pudo pulsar 'Resolucion'.")
+                    continue
+                time.sleep(2.0)
+
+                info_liq = selenium_obtener_info_liquidacion(driver)
+                id_escrito = info_liq.get("id_escrito", "")
+                folio_liq = info_liq.get("folio", "") if str(info_liq.get("folio", "")).isdigit() else ""
+                fecha_liq = info_liq.get("fecha", "") if "/" in str(info_liq.get("fecha", "")) else ""
+
+                if info_liq.get("celdas"):
+                    print(f"\n    [DEBUG] Fila encontrada: {info_liq['celdas']}")
+                    print(f"    [DEBUG] Folio extraido: '{folio_liq}', Fecha extraida: '{fecha_liq}'")
+
+                if id_escrito:
+                    time.sleep(1.0)
+                    if not selenium_clicar_pdf_liquidacion(driver, id_escrito, reintentos=12, pausa=0.5):
+                        print(f"[{rit_completo}] No se pudo disparar el PDF de la liquidacion.")
+
+                datos_pdf = {"total_liq": "", "monto_pen": "", "cuenta_lav": ""}
+                pdf_path = ""
+                if pedir_confirmacion_pdf_descargado():
+                    pdfs = [
+                        os.path.join(carpeta_pdfs, nombre)
+                        for nombre in os.listdir(carpeta_pdfs)
+                        if nombre.lower().endswith(".pdf")
+                    ]
+                    if pdfs:
+                        pdfs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                        pdf_path = pdfs[0]
+                        print(f"[{rit_completo}] PDF detectado: {pdf_path}")
+                        datos_pdf = extraer_datos_liquidacion_desde_pdf(pdf_path)
+                        print(
+                            f"    [PDF] Datos extraidos -> total: {datos_pdf['total_liq']}, "
+                            f"monto pension: {datos_pdf['monto_pen']}, cuenta LAV: {datos_pdf['cuenta_lav']}"
+                        )
+                    else:
+                        print(f"[{rit_completo}] El usuario confirmo PDF, pero no hay ninguno en la carpeta.")
+                else:
+                    print(f"[{rit_completo}] El usuario indico que el PDF no esta listo. Se continua sin autollenado.")
+
+                info = LiquidacionInfoDialog(
+                    root,
+                    title="Liquidacion",
+                    title_text=rit_completo,
+                    initial_total_liq=datos_pdf.get("total_liq", ""),
+                    initial_monto_pen=datos_pdf.get("monto_pen", ""),
+                    initial_cuenta_lav=datos_pdf.get("cuenta_lav", "")
+                ).result
+                if not info:
+                    print(f"[{rit_completo}] Se cancelo el dialogo de cuotas.")
+                    continue
+                tipo, cuotas = info["tipo"], info["cuotas"]
+                total_liquidacion = info.get("total_liq", "")
+
+                selenium_click_radio_grales(driver)
+                time.sleep(0.8)
+
+                noms = ["385034", "1015"] if tipo == "Peso Rojo" and cuotas >= 3 else []
+                if tipo == "Peso Rojo" and cuotas < 3:
+                    noms = ["385034"]
+                elif tipo != "Peso Rojo" and cuotas >= 3:
+                    noms = ["1015"]
+                elif tipo != "Peso Rojo" and cuotas < 3:
+                    noms = ["1025"]
+
+                for nomenclatura in noms:
+                    selenium_agregar_nomenclatura(driver, nomenclatura)
+                    time.sleep(1.0)
+
+                selenium_seleccionar_juez(driver, apellido_juez)
+
+                texto_final = "Notif Liq RD" if cuotas >= 3 else "Notif Liq sin RD"
+                selenium_set_glosa(driver, texto_final)
+
+                debug_login("intentando click en Actuacion")
+                try:
+                    actuacion_clicked = selenium_click_actuacion(driver)
+                    debug_login(f"click Actuacion resultado={actuacion_clicked!r}")
+                    selenium_accept_alerts(driver, timeout=3)
+                    wait_for_ready(driver, timeout=5)
+                except Exception as exc:
+                    print(f"    [DEBUG] No se pudo hacer click en Actuacion: {exc}")
+                    debug_login(f"error click Actuacion: {exc}\n{traceback.format_exc()}")
+
+                ruc_completo = selenium_extraer_ruc(driver)
+                if ruc_completo:
+                    print(f"    [DEBUG] RUC extraido desde pagina principal: {ruc_completo}")
+                else:
+                    print("    [DEBUG] No se pudo extraer RUC desde la pagina principal.")
+
+                print(f"\n--- EXTRAYENDO DATOS PARA {rit_completo} ---")
+                datos_litigantes = []
+                popup_handle = ""
+                main_handle = driver.current_window_handle
+                handles_previos = list(driver.window_handles)
+
+                selenium_override_show_modal_dialog(driver)
+                btn_mod = selenium_find_element_by_text(driver, ["Modificación", "Modificacion"], tags=("button", "input"), timeout=10)
+                if btn_mod and selenium_click_element(driver, btn_mod):
+                    popup_handle = selenium_wait_new_window(driver, handles_previos, timeout=10)
+                else:
+                    print("No se encontro el boton de Modificacion.")
+
+                if popup_handle:
+                    try:
+                        driver.switch_to.window(popup_handle)
+                        selenium_wait_document_ready(driver, timeout=8)
+                        time.sleep(2.0)
+                        if not ruc_completo:
+                            ruc_completo = selenium_extraer_ruc(driver)
+                            if ruc_completo:
+                                print(f"    [DEBUG] RUC encontrado como respaldo en popup: {ruc_completo}")
+                        datos_litigantes = selenium_extraer_litigantes_popup(driver)
+                    except Exception as e_popup:
+                        print(f"Error extrayendo datos del litigante: {e_popup}")
+                    finally:
+                        try:
+                            driver.close()
+                        except Exception:
+                            pass
+                        driver.switch_to.window(main_handle)
+                else:
+                    print("    [DEBUG] No se detecto ventana popup de litigantes.")
+
+                for litigante in datos_litigantes:
+                    print(f" -> Encontrado: [{litigante['sujeto']}] RUT: {litigante['rut']} | Nombre: {litigante['nombre']}")
+                print("------------------------------------------\n")
+
+                datos_res = {"folio": folio_liq, "fecha": fecha_liq, "rit": rit_completo}
+                modificar_word_abierto(
+                    texto=f"{rit_completo}: {texto_final}",
+                    cuotas=cuotas,
+                    datos_litigantes=datos_litigantes,
+                    datos_resolucion=datos_res,
+                    cuenta_lav=info["cuenta_lav"],
+                    ruc_completo=ruc_completo,
+                    total_liquidacion=total_liquidacion
+                )
+
+                if pdf_path and doc_abierto_actual:
+                    insertar_pdf_como_imagenes_en_word(doc_abierto_actual, pdf_path)
+
+                ruta_guardada = guardar_y_cerrar_word_actual(rit_completo)
+                if ruta_guardada:
+                    print(f"    [Word] Archivo final listo: {ruta_guardada}")
+
+                print(f"    [DEBUG] Intentando volver al buscador para {rit_completo}...")
+                if not selenium_ir_al_buscador(driver):
+                    print(f"    [DEBUG] No se encontro el enlace 'Volver al buscador' para {rit_completo}.")
+
+                if index < len(causas) - 1:
+                    if not messagebox.askokcancel(
+                        "Causa Finalizada",
+                        f"Se termino de procesar: {rit_completo}\n\n"
+                        "Presiona OK para continuar con la siguiente causa o Cancelar para detener el proceso."
+                    ):
+                        cerrar_y_eliminar_word_temporal(cerrar_documento=False)
+                        break
+                else:
+                    cerrar_y_eliminar_word_temporal(cerrar_documento=False)
+
+            except Exception as e:
+                print(f"Error procesando {rit_completo}: {e}")
+                cerrar_y_eliminar_word_temporal(cerrar_documento=False)
+
+        messagebox.showinfo("Proceso Terminado", "El procesamiento por lotes ha finalizado.")
+        cerrar_y_eliminar_word_temporal(cerrar_documento=False)
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
 def automatizar_ie_con_rit():
     root = tk.Tk()
     root.withdraw()
@@ -1194,7 +2585,7 @@ def automatizar_ie_con_rit():
         return
 
     # --- Plantillas Word ---
-    global ruta_plantilla_con_rd, ruta_plantilla_sin_rd
+    global ruta_plantilla_con_rd, ruta_plantilla_sin_rd, doc_abierto_actual, ruta_temp_actual
 
     ruta_plantilla_con_rd, ruta_plantilla_sin_rd = resolver_rutas_plantillas()
 
@@ -1314,47 +2705,102 @@ def automatizar_ie_con_rit():
                 print(f"[{rit_completo}] No se encontro el boton 'Resolucion'.")
                 continue
 
+            print(f"    [DEBUG] [{rit_completo}] Haciendo click en Resolucion...")
             resolucion_btn.click()
+            time.sleep(0.5)
+            
+            threading.Thread(target=cerrar_popups_ie_background, daemon=True).start()
             time.sleep(2.0)
 
+            print(f"    [DEBUG] [{rit_completo}] Obteniendo documento del frame body...")
             # C. Checkbox y PDF por ID
             doc = obtener_doc_seguro(obtener_body_frame(ie))
+            if not doc:
+                print(f"[{rit_completo}] No se pudo obtener el documento del frame body despues de Resolucion.")
+                continue
+            
+            print(f"    [DEBUG] [{rit_completo}] Documento obtenido. Buscando pestaña Liquidacion...")
+            
+            # Buscar y hacer click en la pestaña "Liquidación"
+            tab_liquidacion = None
+            try:
+                links = doc.getElementsByTagName("a")
+                print(f"    [DEBUG] [{rit_completo}] Encontrados {links.length} enlaces en el documento")
+                for i in range(links.length):
+                    link = links[i]
+                    texto = str(link.innerText or link.textContent or "").strip()
+                    href = str(link.getAttribute("href") or "")
+                    print(f"    [DEBUG] Enlace {i}: texto='{texto}', href='{href}'")
+                    if "liquidación" in texto.lower() or "liquidacion" in texto.lower():
+                        tab_liquidacion = link
+                        print(f"    [DEBUG] [{rit_completo}] Pestaña Liquidacion encontrada: '{texto}'")
+                        break
+            except Exception as e:
+                print(f"    [DEBUG] Error buscando pestaña Liquidacion: {e}")
+            
+            if tab_liquidacion:
+                print(f"    [DEBUG] [{rit_completo}] Haciendo click en pestaña Liquidacion...")
+                tab_liquidacion.click()
+                time.sleep(2.0)
+                doc = obtener_doc_seguro(obtener_body_frame(ie))
+                if not doc:
+                    print(f"[{rit_completo}] No se pudo obtener el documento despues de click en Liquidacion.")
+                    continue
+                print(f"    [DEBUG] [{rit_completo}] Documento recargado despues de click en Liquidacion")
+            else:
+                print(f"    [DEBUG] [{rit_completo}] No se encontro pestaña Liquidacion, continuando...")
+            
+            print(f"    [DEBUG] [{rit_completo}] Buscando fila de liquidacion de deuda...")
             id_escrito = None
             folio_liq = ""
             fecha_liq = ""
             
             tds = doc.getElementsByTagName("td")
+            print(f"    [DEBUG] [{rit_completo}] Encontrados {tds.length} elementos TD en el documento")
             for i in range(tds.length):
-                if "liquidaciÃ³n de deuda" in str(tds[i].innerText).lower() and str(tds[i].className) == "texto":
+                texto_td = str(tds[i].innerText or "").lower()
+                clase_td = str(tds[i].className or "")
+                if "liquidaci" in texto_td and "deuda" in texto_td and clase_td == "texto":
+                    print(f"    [DEBUG] [{rit_completo}] TD encontrado en posicion {i}: '{texto_td[:50]}...'")
                     tr = tds[i]
                     while tr and tr.tagName.upper() != "TR": tr = tr.parentNode
                     if tr:
-                        # Extraer celdas de esta fila especÃ­fica
+                        # Extraer celdas de esta fila específica
                         try:
                             celdas_tr = tr.getElementsByTagName("td")
                             textos_celdas = [str(celdas_tr[c].innerText).strip() for c in range(celdas_tr.length)]
                             print(f"\n    [DEBUG] Fila encontrada: {textos_celdas}")
                             
                             if len(textos_celdas) >= 6:
-                                # SegÃºn el HTML aportado, Folio estÃ¡ en td 0 y Fecha en td 4
-                                folio_candidato = textos_celdas[0]
-                                fecha_candidata = textos_celdas[4]
+                                # Buscar folio (primer número en la fila)
+                                folio_candidato = ""
+                                fecha_candidata = ""
+                                for idx, celda in enumerate(textos_celdas):
+                                    if celda.isdigit() and not folio_candidato:
+                                        folio_candidato = celda
+                                        print(f"    [DEBUG] Folio encontrado en posicion {idx}: '{celda}'")
+                                    elif "/" in celda and len(celda) >= 8 and not fecha_candidata:
+                                        fecha_candidata = celda
+                                        print(f"    [DEBUG] Fecha encontrada en posicion {idx}: '{celda}'")
                                 
                                 if folio_candidato.isdigit():
                                     folio_liq = folio_candidato
                                 if "/" in fecha_candidata:
                                     fecha_liq = fecha_candidata
                                     
-                            print(f"    [DEBUG] Folio extraÃ­do: '{folio_liq}', Fecha extraÃ­da: '{fecha_liq}'")
+                            print(f"    [DEBUG] Folio extraído: '{folio_liq}', Fecha extraída: '{fecha_liq}'")
                         except Exception as e_celdas:
                             print(f"    [DEBUG] Error extrayendo folio/fecha de la fila: {e_celdas}")
 
                         for inp in tr.getElementsByTagName("input"):
                             if inp.getAttribute("type") == "checkbox":
                                 id_escrito = inp.value
+                                print(f"    [DEBUG] Checkbox encontrado con id_escrito: '{id_escrito}'")
                                 inp.click()
                                 break
-                    if id_escrito: break
+                    if id_escrito: 
+                        print(f"    [DEBUG] Usando primera liquidación encontrada (más reciente)")
+                        break
 
             if id_escrito:
                 time.sleep(1.0)
@@ -1452,9 +2898,11 @@ def automatizar_ie_con_rit():
                 btn_mod = None
                 btns = doc.getElementsByTagName("button")
                 for i in range(btns.length):
-                    btn_text = str(btns[i].innerText).lower()
-                    if "modificaciÃ³n" in btn_text:
+                    btn_text = str(btns[i].innerText or "").lower()
+                    btn_onclick = str(btns[i].getAttribute("onclick") or "").lower()
+                    if "modificación" in btn_text or "modificacion" in btn_text or "showpopupcabecera" in btn_onclick:
                         btn_mod = btns[i]
+                        print(f"    [DEBUG] Botón Modificación encontrado: texto='{btn_text}', onclick='{btn_onclick}'")
                         break
                 
                 if btn_mod:
@@ -1570,17 +3018,17 @@ def automatizar_ie_con_rit():
 
                                 celdas = [str(tds[c].innerText).strip() for c in range(tds.length)]
 
-                                # Estructura real del HTML:
-                                # 0 SRCeI, 1 Fecha, 2 Tipo Lit., 3 RUT, 4 Persona, 5 Nombre o RazÃ³n Social
-                                sujeto = celdas[2].upper() if len(celdas) > 2 else ""
-                                rut = celdas[3] if len(celdas) > 3 else ""
-                                nombre = celdas[5] if len(celdas) > 5 else ""
+                                # Estructura tablaLitigantes:
+                                # 0 Est, 1 Sujeto, 2 Rut, 3 Pers, 4 Nombre, 5 Caj
+                                sujeto = celdas[1].upper() if len(celdas) > 1 else ""
+                                rut = celdas[2] if len(celdas) > 2 else ""
+                                nombre = celdas[4] if len(celdas) > 4 else ""
 
-                                nombre = nombre.replace('\r\n', ' ').replace('\n', ' ').strip()
-                                sujeto_limpio = sujeto.replace('.', '').strip()
+                                nombre = nombre.replace('\r\n', ' ').replace('\n', ' ').replace('&nbsp;', ' ').strip()
+                                sujeto_limpio = sujeto.replace('.', '').replace('&nbsp;', '').strip()
 
                                 # Detectar los tipos que realmente aparecen en esta tabla
-                                if any(s in sujeto for s in ["DTE", "DDO", "ADOLESCENTE", "NIÃ‘A", "NIÃ‘O", "NNA", "SOLICITANTE"]):
+                                if any(s in sujeto_limpio for s in ["DTE", "DDO", "ADOLESCENTE", "NIÑO", "NIÑA", "NNA", "SOLICITANTE"]):
                                     if rut and not any(l['rut'] == rut for l in datos_litigantes):
                                         datos_litigantes.append({
                                             "sujeto": sujeto_limpio,
@@ -1591,7 +3039,7 @@ def automatizar_ie_con_rit():
                         except Exception as e:
                             print(f"Error extrayendo datos del litigante: {e}")
 
-                        # Fallback: si la detecciÃ³n exacta fallÃ³ o cambiÃ³ el orden de columnas,
+                        # Fallback: si la detección exacta falló o cambió el orden de columnas,
                         # recorrer nuevamente la tabla con comparaciones normalizadas.
                         try:
                             if not datos_litigantes:
@@ -1601,18 +3049,20 @@ def automatizar_ie_con_rit():
                                     if tds.length < 4:
                                         continue
                                     celdas = [str(tds[c].innerText).strip() for c in range(tds.length)]
-                                    candidato_sujeto = " ".join(
-                                        [celdas[i] for i in (2, 4, 5) if len(celdas) > i and celdas[i]]
-                                    )
+                                    
+                                    # Estructura tablaLitigantes: 1 Sujeto, 2 Rut, 4 Nombre
+                                    candidato_sujeto = celdas[1] if len(celdas) > 1 else ""
+                                    rut = celdas[2] if len(celdas) > 2 else ""
+                                    nombre = celdas[4] if len(celdas) > 4 else ""
+                                    
                                     sujeto_norm = normalizar_texto(candidato_sujeto)
-                                    if not any(s in sujeto_norm for s in ["dte", "ddo", "adolescente", "nina", "nino", "nna", "solicitante"]):
+                                    if not any(s in sujeto_norm for s in ["dte", "ddo", "adolescente", "niño", "niña", "nina", "nino", "nna", "solicitante"]):
                                         continue
-                                    rut = celdas[3] if len(celdas) > 3 else ""
-                                    nombre = celdas[5] if len(celdas) > 5 else ""
-                                    nombre = nombre.replace('\r\n', ' ').replace('\n', ' ').strip()
+                                    
+                                    nombre = nombre.replace('\r\n', ' ').replace('\n', ' ').replace('&nbsp;', ' ').strip()
                                     if rut and not any(l['rut'] == rut for l in datos_litigantes):
                                         datos_litigantes.append({
-                                            "sujeto": candidato_sujeto.replace('.', '').strip().upper(),
+                                            "sujeto": candidato_sujeto.replace('.', '').replace('&nbsp;', '').strip().upper(),
                                             "rut": rut,
                                             "nombre": nombre
                                         })
@@ -1648,12 +3098,12 @@ def automatizar_ie_con_rit():
                 total_liquidacion=total_liquidacion
             )
 
-            if pdf_path and doc_abierto_actual:
+            if pdf_path and doc_abierto_actual is not None:
                 insertar_pdf_como_imagenes_en_word(doc_abierto_actual, pdf_path)
 
-            ruta_guardada = guardar_y_cerrar_word_actual(rit_completo)
+            ruta_guardada = guardar_word_sin_cerrar(rit_completo)
             if ruta_guardada:
-                print(f"    [Word] Archivo final listo: {ruta_guardada}")
+                print(f"    [Word] Archivo guardado: {ruta_guardada}")
             
             # G. Volver al buscador
             print(f"    [DEBUG] Intentando volver al buscador para {rit_completo}...")
@@ -1663,25 +3113,45 @@ def automatizar_ie_con_rit():
                     print(f"    [DEBUG] Encontrado enlace 'Volver al buscador'. Clickeando...")
                     link.click()
                     time.sleep(3.0) # Aumentar el tiempo de espera
-                    # Esperar a que la pÃ¡gina de IE estÃ© lista despuÃ©s de la navegaciÃ³n
+                    # Esperar a que la página de IE esté lista después de la navegación
                     for _ in range(10): # Esperar hasta 5 segundos
                         if ie.ReadyState == 4: # READYSTATE_COMPLETE
-                            print(f"    [DEBUG] IE ReadyState: COMPLETE despuÃ©s de volver al buscador.")
+                            print(f"    [DEBUG] IE ReadyState: COMPLETE después de volver al buscador.")
                             break
                         time.sleep(0.5)
                     else:
-                        print(f"    [DEBUG] IE ReadyState no COMPLETE despuÃ©s de volver al buscador en {rit_completo}.")
+                        print(f"    [DEBUG] IE ReadyState no COMPLETE después de volver al buscador en {rit_completo}.")
                     break
             else:
-                print(f"    [DEBUG] No se encontrÃ³ el enlace 'Volver al buscador' para {rit_completo}.")
+                print(f"    [DEBUG] No se encontró el enlace 'Volver al buscador' para {rit_completo}.")
             
-            # NUEVO: Pausa de confirmaciÃ³n para seguir con la siguiente causa
+            # Pausa de confirmación para seguir con la siguiente causa
             if index < len(causas) - 1:
-                if not messagebox.askokcancel("Causa Finalizada", f"Se terminÃ³ de procesar: {rit_completo}\n\nPresiona OK para continuar con la siguiente causa o Cancelar para detener el proceso."):
-                    cerrar_y_eliminar_word_temporal(cerrar_documento=False)
+                if not messagebox.askokcancel("Causa Finalizada", f"Se terminó de procesar: {rit_completo}\n\nPresiona OK para continuar con la siguiente causa o Cancelar para detener el proceso."):
+                    cerrar_y_eliminar_word_temporal(cerrar_documento=True)
                     break
+                else:
+                    # Usuario presionó OK, cerrar el Word actual antes de continuar
+                    try:
+                        if doc_abierto_actual is not None:
+                            messagebox.showinfo("Cerrando documento", f"Se cerrará el documento Word de {rit_completo} al aceptar este mensaje.")
+                            doc_abierto_actual.Close(0)
+                            print(f"    [Word] Documento cerrado después de confirmación")
+                            doc_abierto_actual = None
+                            ruta_temp_actual = None
+                    except Exception as e_close:
+                        print(f"    [Word] Error cerrando documento: {e_close}")
             else:
-                cerrar_y_eliminar_word_temporal(cerrar_documento=False)
+                # Última causa, cerrar el Word
+                try:
+                    if doc_abierto_actual is not None:
+                        messagebox.showinfo("Cerrando documento", f"Se cerrará el documento Word de {rit_completo} al aceptar este mensaje.")
+                        doc_abierto_actual.Close(0)
+                        print(f"    [Word] Documento cerrado (última causa)")
+                        doc_abierto_actual = None
+                        ruta_temp_actual = None
+                except Exception as e_close:
+                    print(f"    [Word] Error cerrando documento: {e_close}")
 
         except Exception as e:
             print(f"Error procesando {rit_completo}: {e}")
@@ -1690,8 +3160,11 @@ def automatizar_ie_con_rit():
     messagebox.showinfo("Proceso Terminado", "El procesamiento por lotes ha finalizado.")
     cerrar_y_eliminar_word_temporal(cerrar_documento=False)
 
-if __name__ == "__main__":
+def automatizar_con_backend():
     automatizar_ie_con_rit()
+
+if __name__ == "__main__":
+    automatizar_con_backend()
 
 
 
