@@ -1,12 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
 
 a = Analysis(
-    ['C:\\Users\\Eri\\Desktop\\Programación\\notificaciones sitfa\\main.py'],
+    [os.path.join(os.path.dirname(__file__), 'web_ui.py')],
     pathex=[],
     binaries=[],
-    datas=[('Notifica liq CON RD.doc', '.'), ('Notifica liq sin rd.doc', '.')],
-    hiddenimports=[],
+    datas=[('Notifica liq CON RD.doc', '.'), ('Notifica liq sin rd.doc', '.'), ('IEDriverServer.exe', '.')],
+    hiddenimports=['main', 'pythoncom', 'win32com.client', 'win32gui', 'win32con'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -39,6 +39,22 @@ except Exception as exc:
 ruta_plantilla_con_rd = None
 ruta_plantilla_sin_rd = None
 
+# Puente opcional para interfaces externas (por ejemplo, la interfaz web).
+# Cuando no se configura, la aplicación conserva sus diálogos de Tkinter.
+UI_CONFIRM_CALLBACK = None
+UI_LIQUIDACION_CALLBACK = None
+UI_STOP_EVENT = None
+
+
+def automation_should_stop():
+    return bool(UI_STOP_EVENT is not None and UI_STOP_EVENT.is_set())
+
+
+def solicitar_datos_liquidacion(parent, **kwargs):
+    if UI_LIQUIDACION_CALLBACK:
+        return UI_LIQUIDACION_CALLBACK(**kwargs)
+    return LiquidacionInfoDialog(parent, **kwargs).result
+
 LOGIN_URL = "http://www.familia.pjud/SITFAWEB/jsp/Login/Login.jsp"
 POST_LOGIN_URL = "http://www.familia.pjud/SITFAWEB/MenuLinkAction.do?opMenu=ConsultaRolTramitar&opRol=59"
 
@@ -1179,18 +1195,27 @@ def sanitizar_nombre_archivo(nombre):
     limpio = limpio.strip().rstrip(".")
     return limpio or "documento"
 
+
+def resolver_carpeta_aplicacion():
+    """Devuelve la carpeta del proyecto o la carpeta junto al EXE empaquetado."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
 def guardar_word_sin_cerrar(nombre_base_salida):
-    """Guarda el documento Word abierto con el nombre de la causa en la carpeta del proyecto."""
+    """Guarda el documento Word abierto en la carpeta salidas sin cerrarlo."""
     global doc_abierto_actual, ruta_temp_actual
     if not doc_abierto_actual or not ruta_temp_actual:
         print("    [Word] No hay documento abierto para guardar.")
         return ""
 
     try:
-        carpeta_proyecto = os.path.dirname(os.path.abspath(__file__))
+        carpeta_proyecto = resolver_carpeta_aplicacion()
+        carpeta_salida = os.path.join(carpeta_proyecto, "salidas")
+        os.makedirs(carpeta_salida, exist_ok=True)
         extension = os.path.splitext(ruta_temp_actual)[1] or ".doc"
         nombre_archivo = f"{sanitizar_nombre_archivo(nombre_base_salida)}{extension}"
-        ruta_salida = os.path.join(carpeta_proyecto, nombre_archivo)
+        ruta_salida = os.path.join(carpeta_salida, nombre_archivo)
 
         if os.path.exists(ruta_salida):
             try:
@@ -1218,7 +1243,7 @@ def guardar_y_cerrar_word_actual(nombre_base_salida):
         return ""
 
     try:
-        carpeta_base = os.path.dirname(os.path.abspath(__file__))
+        carpeta_base = resolver_carpeta_aplicacion()
         carpeta_salida = os.path.join(carpeta_base, "salidas")
         os.makedirs(carpeta_salida, exist_ok=True)
         extension = os.path.splitext(ruta_temp_actual)[1] or ".doc"
@@ -1466,15 +1491,34 @@ def leer_excel_causas(ruta_archivo):
         row = 2
         while True:
             rit = sheet.Cells(row, 1).Value
-            juez = sheet.Cells(row, 2).Value
             if not rit: break
-            datos.append({"rit": str(rit).strip(), "juez": str(juez).strip() if juez else ""})
+            datos.append({"rit": str(rit).strip()})
             row += 1
         wb.Close(False)
         excel.Quit()
     except Exception as e:
         print(f"Error al leer Excel: {e}")
     return datos
+
+
+def preparar_causas_con_jueces(causas, jueces=None):
+    """Asocia cada RIT al juez cuyo índice coincide con el último dígito del rol."""
+    if jueces is None:
+        return causas or []
+
+    nombres = [str(juez or "").strip() for juez in jueces]
+    if len(nombres) != 10:
+        raise ValueError("Se requieren exactamente 10 jueces, indexados del 0 al 9.")
+
+    resultado = []
+    for causa in causas or []:
+        rit = str(causa.get("rit", "") if isinstance(causa, dict) else causa).strip()
+        partes = rit.split("-")
+        if len(partes) < 2 or not partes[1].strip() or not partes[1].strip()[-1].isdigit():
+            raise ValueError(f"RIT inválido o sin rol numérico: {rit}")
+        indice_juez = int(partes[1].strip()[-1])
+        resultado.append({"rit": rit, "juez": nombres[indice_juez]})
+    return resultado
 
 
 BROWSER_BACKEND = os.environ.get("SITFA_BROWSER_BACKEND", "selenium_ie_mode").strip().lower()
@@ -2259,15 +2303,17 @@ def selenium_ir_al_buscador(driver):
         return False
 
 
-def automatizar_selenium_edge_ie_con_rit():
+def automatizar_selenium_edge_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, jueces=None):
     root = tk.Tk()
     root.withdraw()
 
-    archivo_excel = filedialog.askopenfilename(title="Selecciona el archivo Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
+    if not archivo_excel:
+        archivo_excel = filedialog.askopenfilename(title="Selecciona el archivo Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
     if not archivo_excel:
         return
 
-    carpeta_pdfs = filedialog.askdirectory(title="Selecciona la carpeta donde se descargara el PDF")
+    if not carpeta_pdfs:
+        carpeta_pdfs = filedialog.askdirectory(title="Selecciona la carpeta donde se descargara el PDF")
     if not carpeta_pdfs:
         messagebox.showinfo("Cancelado", "No se selecciono una carpeta para los PDF. Proceso terminado.")
         return
@@ -2294,7 +2340,9 @@ def automatizar_selenium_edge_ie_con_rit():
             messagebox.showinfo("Cancelado", "Seleccion de plantilla 'sin RD' cancelada. Proceso terminado.")
             return
 
-    causas = leer_excel_causas(archivo_excel)
+    if causas is None:
+        causas = leer_excel_causas(archivo_excel)
+    causas = preparar_causas_con_jueces(causas, jueces)
     if not causas:
         messagebox.showerror("Error", "No se encontraron datos en el Excel.")
         return
@@ -2315,6 +2363,9 @@ def automatizar_selenium_edge_ie_con_rit():
             print(f"    [WARN] No se pudo preparar el formulario de consulta automaticamente: {exc}")
 
         for index, item in enumerate(causas):
+            if automation_should_stop():
+                print("[SITFA] Detención solicitada desde la interfaz.")
+                break
             rit_completo = item["rit"]
             apellido_juez = item["juez"].lower()
 
@@ -2437,17 +2488,20 @@ def automatizar_selenium_edge_ie_con_rit():
                 else:
                     print(f"[{rit_completo}] El usuario indico que el PDF no esta listo. Se continua sin autollenado.")
 
-                info = LiquidacionInfoDialog(
+                info = solicitar_datos_liquidacion(
                     root,
                     title="Liquidacion",
                     title_text=rit_completo,
                     initial_total_liq=datos_pdf.get("total_liq", ""),
                     initial_monto_pen=datos_pdf.get("monto_pen", ""),
                     initial_cuenta_lav=datos_pdf.get("cuenta_lav", "")
-                ).result
+                )
                 if not info:
                     print(f"[{rit_completo}] Se cancelo el dialogo de cuotas.")
                     continue
+                if automation_should_stop():
+                    print("[SITFA] Detención solicitada desde la interfaz.")
+                    break
                 tipo, cuotas = info["tipo"], info["cuotas"]
                 total_liquidacion = info.get("total_liq", "")
 
@@ -2571,15 +2625,17 @@ def automatizar_selenium_edge_ie_con_rit():
             except Exception:
                 pass
 
-def automatizar_ie_con_rit():
+def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, jueces=None):
     root = tk.Tk()
     root.withdraw()
 
-    archivo_excel = filedialog.askopenfilename(title="Selecciona el archivo Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
+    if not archivo_excel:
+        archivo_excel = filedialog.askopenfilename(title="Selecciona el archivo Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
     if not archivo_excel: 
         return
 
-    carpeta_pdfs = filedialog.askdirectory(title="Selecciona la carpeta donde se descargarÃ¡ el PDF")
+    if not carpeta_pdfs:
+        carpeta_pdfs = filedialog.askdirectory(title="Selecciona la carpeta donde se descargarÃ¡ el PDF")
     if not carpeta_pdfs:
         messagebox.showinfo("Cancelado", "No se seleccionÃ³ una carpeta para los PDF. Proceso terminado.")
         return
@@ -2608,7 +2664,9 @@ def automatizar_ie_con_rit():
             return
     # -----------------------------------
 
-    causas = leer_excel_causas(archivo_excel)
+    if causas is None:
+        causas = leer_excel_causas(archivo_excel)
+    causas = preparar_causas_con_jueces(causas, jueces)
     if not causas:
         messagebox.showerror("Error", "No se encontraron datos en el Excel.")
         return
@@ -2627,6 +2685,9 @@ def automatizar_ie_con_rit():
     except: return
 
     for index, item in enumerate(causas):
+        if automation_should_stop():
+            print("[SITFA] Detención solicitada desde la interfaz.")
+            break
         rit_completo = item["rit"]
         apellido_juez = item["juez"].lower()
 
@@ -2831,14 +2892,14 @@ def automatizar_ie_con_rit():
             else:
                 print(f"[{rit_completo}] El usuario indicÃ³ que el PDF no estÃ¡ listo. Se continÃºa sin autollenado.")
 
-            info = LiquidacionInfoDialog(
+            info = solicitar_datos_liquidacion(
                 root,
                 title="LiquidaciÃ³n",
                 title_text=rit_completo,
                 initial_total_liq=datos_pdf.get("total_liq", ""),
                 initial_monto_pen=datos_pdf.get("monto_pen", ""),
                 initial_cuenta_lav=datos_pdf.get("cuenta_lav", "")
-            ).result
+            )
             if not info:
                 print(f"[{rit_completo}] Se cancelÃ³ el diÃ¡logo de cuotas.")
                 continue
@@ -3160,8 +3221,13 @@ def automatizar_ie_con_rit():
     messagebox.showinfo("Proceso Terminado", "El procesamiento por lotes ha finalizado.")
     cerrar_y_eliminar_word_temporal(cerrar_documento=False)
 
-def automatizar_con_backend():
-    automatizar_ie_con_rit()
+def automatizar_con_backend(archivo_excel=None, carpeta_pdfs=None, causas=None, jueces=None):
+    automatizar_ie_con_rit(
+        archivo_excel=archivo_excel,
+        carpeta_pdfs=carpeta_pdfs,
+        causas=causas,
+        jueces=jueces,
+    )
 
 if __name__ == "__main__":
     automatizar_con_backend()

@@ -1,5 +1,4 @@
 import argparse
-import os
 import re
 import shutil
 import subprocess
@@ -9,9 +8,18 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
 VENV_PYINSTALLER = PROJECT_DIR / ".venv" / "Scripts" / "pyinstaller.exe"
-MAIN_PY = PROJECT_DIR / "main.py"
+ENTRY_PY = PROJECT_DIR / "web_ui.py"
 DIST_DIR = PROJECT_DIR / "dist"
-BUILD_DIR = PROJECT_DIR / "build"
+
+
+def pyinstaller_command():
+    """Usa el PyInstaller del venv, del PATH o del Python actual."""
+    if VENV_PYINSTALLER.exists():
+        return [str(VENV_PYINSTALLER)]
+    executable = shutil.which("pyinstaller")
+    if executable:
+        return [executable]
+    return [sys.executable, "-m", "PyInstaller"]
 
 
 def next_version():
@@ -26,24 +34,38 @@ def next_version():
 
 
 def build(version):
-    if not VENV_PYINSTALLER.exists():
-        raise FileNotFoundError(f"No se encontró PyInstaller en: {VENV_PYINSTALLER}")
-    if not MAIN_PY.exists():
-        raise FileNotFoundError(f"No se encontró main.py en: {MAIN_PY}")
+    if not ENTRY_PY.exists():
+        raise FileNotFoundError(f"No se encontró web_ui.py en: {ENTRY_PY}")
+    for required in ("Notifica liq CON RD.doc", "Notifica liq sin rd.doc", "IEDriverServer.exe"):
+        if not (PROJECT_DIR / required).exists():
+            raise FileNotFoundError(f"No se encontró el archivo requerido: {PROJECT_DIR / required}")
 
     DIST_DIR.mkdir(exist_ok=True)
 
-    cmd = [
-        str(VENV_PYINSTALLER),
+    cmd = pyinstaller_command() + [
         "--noconfirm",
         "--onefile",
         "--name",
         "notificaciones_sitfa",
+        "--specpath",
+        str(PROJECT_DIR / "build"),
         "--add-data",
-        "Notifica liq CON RD.doc;.",
+        f"{PROJECT_DIR / 'Notifica liq CON RD.doc'};.",
         "--add-data",
-        "Notifica liq sin rd.doc;.",
-        str(MAIN_PY),
+        f"{PROJECT_DIR / 'Notifica liq sin rd.doc'};.",
+        "--add-data",
+        f"{PROJECT_DIR / 'IEDriverServer.exe'};.",
+        "--hidden-import",
+        "main",
+        "--hidden-import",
+        "pythoncom",
+        "--hidden-import",
+        "win32com.client",
+        "--hidden-import",
+        "win32gui",
+        "--hidden-import",
+        "win32con",
+        str(ENTRY_PY),
     ]
 
     subprocess.run(cmd, cwd=str(PROJECT_DIR), check=True)
@@ -74,9 +96,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except subprocess.CalledProcessError as e:
-        print(f"Error ejecutando PyInstaller: {e}")
-        sys.exit(e.returncode)
-    except Exception as e:
-        print(f"Error: {e}")
+    except subprocess.CalledProcessError as exc:
+        print(f"Error ejecutando PyInstaller: {exc}")
+        sys.exit(exc.returncode)
+    except Exception as exc:
+        print(f"Error: {exc}")
         sys.exit(1)
