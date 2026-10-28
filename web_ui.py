@@ -531,6 +531,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    from actualizador import verificar_actualizacion_obligatoria
+
+    if not verificar_actualizacion_obligatoria():
+        return
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}"
     print(f"SITFA UI disponible en {url}")

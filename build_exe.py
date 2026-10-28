@@ -10,6 +10,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 VENV_PYINSTALLER = PROJECT_DIR / ".venv" / "Scripts" / "pyinstaller.exe"
 ENTRY_PY = PROJECT_DIR / "web_ui.py"
 DIST_DIR = PROJECT_DIR / "dist"
+VERSION_PY = PROJECT_DIR / "version.py"
 
 
 def pyinstaller_command():
@@ -41,6 +42,19 @@ def build(version):
             raise FileNotFoundError(f"No se encontró el archivo requerido: {PROJECT_DIR / required}")
 
     DIST_DIR.mkdir(exist_ok=True)
+    VERSION_PY.write_text(f'"""Version generada durante el build."""\nAPP_VERSION = {version}\n', encoding="utf-8")
+
+    helper_cmd = pyinstaller_command() + [
+        "--noconfirm",
+        "--onefile",
+        "--windowed",
+        "--name",
+        "updater_helper",
+        "--specpath",
+        str(PROJECT_DIR / "build"),
+        str(PROJECT_DIR / "updater_helper.py"),
+    ]
+    subprocess.run(helper_cmd, cwd=str(PROJECT_DIR), check=True)
 
     cmd = pyinstaller_command() + [
         "--noconfirm",
@@ -80,6 +94,7 @@ def build(version):
 
     shutil.copy2(base_exe, versioned_exe)
     print(f"Ejecutable generado: {versioned_exe}")
+    print(f"Ejecutable del actualizador: {DIST_DIR / 'updater_helper.exe'}")
     return versioned_exe
 
 
