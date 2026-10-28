@@ -1274,8 +1274,14 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
         ruta_doc_a_usar = os.path.abspath(ruta_doc_a_usar)
         print(f"    [Word] Ruta confirmada: {ruta_doc_a_usar}")
 
-        print(f"    [Word] Abriendo plantilla: {ruta_doc_a_usar}")
-        os.startfile(ruta_doc_a_usar)
+        # Se trabaja con una copia de la plantilla: la original no se modifica y
+        # la copia no hereda la marca de "archivo de internet" que haría que Word
+        # abra el documento en Vista protegida.
+        import shutil
+        carpeta_copia = tempfile.mkdtemp(prefix="sitfa_word_")
+        ruta_copia = os.path.join(carpeta_copia, os.path.basename(ruta_doc_a_usar))
+        shutil.copyfile(ruta_doc_a_usar, ruta_copia)
+        print(f"    [Word] Abriendo copia de la plantilla: {ruta_copia}")
 
         try:
             word = win32com.client.GetActiveObject("Word.Application")
@@ -1288,19 +1294,23 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
         except Exception:
             pass
 
-        # Esperar a que Word termine de abrir la plantilla antes de editarla.
+        # Documents.Open devuelve el documento directamente, sin depender de
+        # ActiveDocument. Se reintenta si Word está ocupado (diálogo abierto).
         doc_word = None
-        for _ in range(30):
+        ultimo_error = None
+        for intento in range(1, 6):
             try:
-                doc_word = word.ActiveDocument
-                if doc_word and os.path.basename(getattr(doc_word, "FullName", "")).lower() == os.path.basename(ruta_doc_a_usar).lower():
-                    break
-            except Exception:
-                doc_word = None
-            time.sleep(0.5)
+                # FileName, ConfirmConversions, ReadOnly, AddToRecentFiles
+                doc_word = word.Documents.Open(ruta_copia, False, False, False)
+                break
+            except Exception as e_open:
+                ultimo_error = e_open
+                print(f"    [Word] Intento {intento} de abrir la plantilla falló: {e_open}")
+                time.sleep(1.5)
 
-        if not doc_word:
-            print("    [Word] No se pudo obtener el documento activo después de esperar la apertura.")
+        if doc_word is None:
+            print(f"    [Word] No se pudo abrir la plantilla en Word después de 5 intentos: {ultimo_error}")
+            print("    [Word] Revise que Word no tenga un cuadro de diálogo abierto y vuelva a intentarlo.")
             return False
 
         doc_word.Activate()
@@ -1311,7 +1321,7 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
             pass
         time.sleep(0.5)
         doc_abierto_actual = doc_word
-        ruta_temp_actual = ruta_doc_a_usar
+        ruta_temp_actual = ruta_copia
         
         # Debug: mostrar contenido del documento para ver qué marcadores hay
         try:
