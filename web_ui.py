@@ -102,12 +102,16 @@ def request_confirmation(title, message):
     return bool(response) and not STOP_EVENT.is_set()
 
 
+def solo_digitos(valor):
+    return "".join(ch for ch in str(valor or "") if ch.isdigit())
+
+
 def request_liquidacion(**kwargs):
     payload = {
         "title": kwargs.get("title") or "Liquidación",
         "title_text": kwargs.get("title_text", ""),
-        "initial_total_liq": kwargs.get("initial_total_liq", ""),
-        "initial_monto_pen": kwargs.get("initial_monto_pen", ""),
+        "initial_total_liq": solo_digitos(kwargs.get("initial_total_liq", "")),
+        "initial_monto_pen": solo_digitos(kwargs.get("initial_monto_pen", "")),
         "initial_cuenta_lav": kwargs.get("initial_cuenta_lav", ""),
     }
     response = wait_for_interaction("liquidacion", payload)
@@ -174,7 +178,7 @@ def read_rits_from_excel(archivo_excel: str):
         pythoncom.CoUninitialize()
 
 
-def run_automation(archivo_excel: str, carpeta_pdfs: str, causas, jueces):
+def run_automation(archivo_excel: str, carpeta_pdfs: str, causas, jueces, juez_unico=None):
     import main
     import pythoncom
 
@@ -198,6 +202,7 @@ def run_automation(archivo_excel: str, carpeta_pdfs: str, causas, jueces):
             carpeta_pdfs=carpeta_pdfs,
             causas=causas,
             jueces=jueces,
+            juez_unico=juez_unico,
         )
         print("=== SITFA: proceso finalizado ===")
     except Exception as exc:
@@ -216,6 +221,18 @@ def run_automation(archivo_excel: str, carpeta_pdfs: str, causas, jueces):
             STATE.running = False
 
 
+def parse_juez_unico(payload):
+    if not payload or not payload.get("activo"):
+        return None
+    nombre = str(payload.get("nombre", "")).strip()
+    anio_hasta = str(payload.get("anio_hasta", "")).strip()
+    if not nombre:
+        raise ValueError("Debes indicar el nombre del juez único.")
+    if len(anio_hasta) != 4 or not anio_hasta.isdigit():
+        raise ValueError("El año límite del juez único debe tener 4 dígitos.")
+    return {"nombre": nombre, "anio_hasta": int(anio_hasta)}
+
+
 def start_run(payload):
     archivo_excel = str(payload.get("archivo_excel", "")).strip()
     carpeta_pdfs = str(payload.get("carpeta_pdfs", "")).strip()
@@ -226,11 +243,10 @@ def start_run(payload):
     if not Path(carpeta_pdfs).is_dir():
         raise ValueError("La carpeta de PDF no existe.")
     causas = payload.get("causas") or []
-    jueces = payload.get("jueces") or []
+    jueces = [str(juez).strip() for juez in payload.get("jueces") or []]
+    juez_unico = parse_juez_unico(payload.get("juez_unico"))
     if not causas:
         raise ValueError("Debes cargar o agregar al menos un RIT.")
-    if len(jueces) != 10 or any(not str(juez).strip() for juez in jueces):
-        raise ValueError("Debes ingresar los 10 jueces, desde el índice 0 al 9.")
     clean_causas = []
     for causa in causas:
         rit = str(causa.get("rit", "") if isinstance(causa, dict) else causa).strip().upper()
@@ -238,6 +254,13 @@ def start_run(payload):
         if len(partes) != 3 or not partes[0] or not partes[1].isdigit() or not partes[2].isdigit():
             raise ValueError(f"RIT inválido: {rit}")
         clean_causas.append({"rit": rit})
+    # Los 10 índices solo se exigen si alguna causa no queda cubierta por el juez único.
+    requiere_indices = any(
+        juez_unico is None or int(causa["rit"].split("-")[2]) > juez_unico["anio_hasta"]
+        for causa in clean_causas
+    )
+    if requiere_indices and (len(jueces) != 10 or any(not juez for juez in jueces)):
+        raise ValueError("Debes ingresar los 10 jueces, desde el índice 0 al 9.")
 
     with STATE.lock:
         if STATE.running:
@@ -245,7 +268,7 @@ def start_run(payload):
     STOP_EVENT.clear()
     threading.Thread(
         target=run_automation,
-        args=(archivo_excel, carpeta_pdfs, clean_causas, [str(juez).strip() for juez in jueces]),
+        args=(archivo_excel, carpeta_pdfs, clean_causas, jueces, juez_unico),
         daemon=True,
         name="sitfa-automation",
     ).start()
@@ -324,6 +347,11 @@ button:disabled { opacity:.55; cursor:not-allowed; }
     <div id="rit-list" class="rit-list"><p class="notice">Selecciona un Excel o agrega un RIT manualmente.</p></div>
     <div class="section-label"><h3>Jueces asociados</h3><span class="notice">Índice 0 al 9</span></div>
     <div id="judge-list" class="judge-grid"></div>
+    <label><input id="juez-unico-activo" type="checkbox" onchange="toggleJuezUnico()"> Un solo juez para causas hasta cierto año</label>
+    <div id="juez-unico-fields" class="form-grid" style="display:none">
+      <div><label for="juez-unico-nombre">Juez único</label><input id="juez-unico-nombre" type="text" placeholder="Nombre del juez" autocomplete="off" oninput="renderRits()"></div>
+      <div><label for="juez-unico-anio">Causas hasta el año (inclusive)</label><input id="juez-unico-anio" type="text" inputmode="numeric" placeholder="2025" maxlength="4" autocomplete="off" oninput="renderRits()"></div>
+    </div>
     <label for="pdfs">Carpeta para descargar PDF</label>
     <div class="path-row"><input id="pdfs" type="text" placeholder="C:\\...\\descargas" autocomplete="off"><button class="secondary" onclick="choose('folder')">Elegir</button></div>
     <button id="start" class="primary" onclick="startRun()">Iniciar automatización</button>
@@ -365,8 +393,11 @@ function renderRits() {
   $('rit-count').textContent = '(' + rits.length + ')';
   const list = $('rit-list');
   if (!rits.length) { list.innerHTML = '<p class="notice">No hay RIT cargados.</p>'; return; }
-  list.innerHTML = rits.map((rit, i) => { const idx = judgeIndex(rit); const judge = idx >= 0 ? (getJudges()[idx] || 'sin asignar') : 'RIT inválido'; return '<div class="rit-row"><input type="text" value="' + escapeHtml(rit) + '" aria-label="RIT ' + (i+1) + '" onchange="updateRit(' + i + ', this.value)"><span class="rit-assignment">Índice ' + (idx >= 0 ? idx : '-') + ': ' + escapeHtml(judge) + '</span><button class="secondary icon-button" onclick="removeRit(' + i + ')" aria-label="Eliminar RIT">Eliminar</button></div>'; }).join('');
+  list.innerHTML = rits.map((rit, i) => { const idx = judgeIndex(rit); const unico = getJuezUnico(); const anio = ritYear(rit); const assignment = unico && anio !== null && anio <= Number(unico.anio_hasta) ? 'Juez único: ' + unico.nombre : (idx >= 0 ? 'Índice ' + idx + ': ' + (getJudges()[idx] || 'sin asignar') : 'RIT inválido'); return '<div class="rit-row"><input type="text" value="' + escapeHtml(rit) + '" aria-label="RIT ' + (i+1) + '" onchange="updateRit(' + i + ', this.value)"><span class="rit-assignment">' + escapeHtml(assignment) + '</span><button class="secondary icon-button" onclick="removeRit(' + i + ')" aria-label="Eliminar RIT">Eliminar</button></div>'; }).join('');
 }
+function toggleJuezUnico() { $('juez-unico-fields').style.display = $('juez-unico-activo').checked ? 'grid' : 'none'; renderRits(); }
+function getJuezUnico() { if (!$('juez-unico-activo').checked) return null; return {activo:true, nombre:$('juez-unico-nombre').value.trim(), anio_hasta:$('juez-unico-anio').value.trim()}; }
+function ritYear(rit) { const parts = String(rit || '').split('-'); return parts.length === 3 && /^\d+$/.test(parts[2]) ? Number(parts[2]) : null; }
 function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char])); }
 function updateRit(index, value) { rits[index] = value.trim().toUpperCase(); }
 function judgeIndex(rit) { const parts = String(rit || '').split('-'); return parts.length === 3 && /\d/.test(parts[1]) ? Number(parts[1].slice(-1)) : -1; }
@@ -383,7 +414,7 @@ function renderJudges() {
 }
 function getJudges() { return Array.from({length:10}, (_, i) => $('judge-' + i).value.trim()); }
 async function startRun() {
-  const res = await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({archivo_excel:$('excel').value, carpeta_pdfs:$('pdfs').value, causas:rits.map(rit => ({rit})), jueces:getJudges()})});
+  const res = await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({archivo_excel:$('excel').value, carpeta_pdfs:$('pdfs').value, causas:rits.map(rit => ({rit})), jueces:getJudges(), juez_unico:getJuezUnico()})});
   const data = await res.json();
   if (!data.ok) showLocalMessage(data.error);
   refresh();
