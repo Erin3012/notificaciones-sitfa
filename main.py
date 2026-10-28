@@ -128,7 +128,7 @@ def resolver_rutas_plantillas():
     if meipass_dir:
         candidatos_base.append(meipass_dir)
 
-    # Ãšltimo fallback: carpeta del script.
+    # Último fallback: carpeta del script.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidatos_base.append(script_dir)
 
@@ -328,30 +328,30 @@ except ImportError:
     win32con = None
 
 class LiquidacionInfoDialog(simpledialog.Dialog):
-    """Cuadro de diÃ¡logo para elegir tipo de liquidaciÃ³n y calcular cuotas."""
+    """Cuadro de diálogo para elegir tipo de liquidación y calcular cuotas."""
     def body(self, master):
         tk.Label(master, text=f"Procesando: {self.title_text}", font=("Arial", 10, "bold")).grid(row=0, column=0, columnspan=2, pady=10)
         
-        tk.Label(master, text="Tipo de LiquidaciÃ³n:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        tk.Label(master, text="Tipo de Liquidación:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
         self.var_tipo = tk.StringVar(master)
         self.var_tipo.set("Peso Rojo")
         
         tk.Radiobutton(master, text="Peso Rojo", variable=self.var_tipo, value="Peso Rojo").grid(row=2, column=0, padx=20, sticky="w")
         tk.Radiobutton(master, text="Manual Excel", variable=self.var_tipo, value="Manual Excel").grid(row=3, column=0, padx=20, sticky="w")
 
-        tk.Label(master, text="Total liquidaciÃ³n:").grid(row=4, column=0, padx=10, pady=5, sticky="w")
+        tk.Label(master, text="Total liquidación:").grid(row=4, column=0, padx=10, pady=5, sticky="w")
         self.entry_total_liq = tk.Entry(master, width=15)
         self.entry_total_liq.grid(row=4, column=1, padx=10, pady=5)
         if getattr(self, "initial_total_liq", ""):
             self.entry_total_liq.insert(0, limpiar_separadores_numericos(self.initial_total_liq))
         
-        tk.Label(master, text="Monto pensiÃ³n mensual:").grid(row=5, column=0, padx=10, pady=5, sticky="w")
+        tk.Label(master, text="Monto pensión mensual:").grid(row=5, column=0, padx=10, pady=5, sticky="w")
         self.entry_monto_pen = tk.Entry(master, width=15)
         self.entry_monto_pen.grid(row=5, column=1, padx=10, pady=5)
         if getattr(self, "initial_monto_pen", ""):
             self.entry_monto_pen.insert(0, limpiar_separadores_numericos(self.initial_monto_pen))
 
-        tk.Label(master, text="NÂ° Cuenta LAV:").grid(row=6, column=0, padx=10, pady=10, sticky="w")
+        tk.Label(master, text="N° Cuenta LAV:").grid(row=6, column=0, padx=10, pady=10, sticky="w")
         self.entry_cuenta_lav = tk.Entry(master, width=25)
         self.entry_cuenta_lav.grid(row=6, column=1, padx=10, pady=10)
         if getattr(self, "initial_cuenta_lav", ""):
@@ -392,7 +392,7 @@ class LiquidacionInfoDialog(simpledialog.Dialog):
         }
 
 def extraer_datos_liquidacion_desde_pdf(pdf_path):
-    """Extrae total de liquidacion y el ultimo valor de Pension reajustada desde un PDF."""
+    """Extrae total de liquidacion, monto de pension mensual y cuenta LAV desde un PDF."""
     import re
     datos = {
         "total_liq": "",
@@ -419,11 +419,53 @@ def extraer_datos_liquidacion_desde_pdf(pdf_path):
         if not texto:
             return ""
         texto = texto.replace("$", "").replace(" ", "")
+        if re.fullmatch(r"\d{1,3}([.,]\d{3})+", texto):
+            # Pesos sin decimales: "2,459,018" y "2.459.018" son el mismo monto.
+            texto = re.sub(r"[.,]", "", texto)
         try:
             numero = float(texto.replace(".", "").replace(",", "."))
             return "${:,.0f}".format(int(round(numero))).replace(",", ".")
         except Exception:
             return valor.strip() if isinstance(valor, str) else texto
+
+    def es_monto_pesos(valor):
+        return bool(re.fullmatch(r"\$?\s?\d{1,3}(?:[.,]\d{3})+|\$?\s?\d+", valor or ""))
+
+    def es_fila_resumen(celdas):
+        texto = normalizar_comparacion(" ".join(celdas))
+        return "total" in texto or "subtotal" in texto or "deuda" in texto
+
+    def indice_columna_pension(filas):
+        encabezado = [normalizar_comparacion(c) for c in filas[0]]
+        detalle = [[limpiar_texto(c) for c in fila] for fila in filas[1:]]
+        # El nombre de la columna cambia entre liquidaciones: se prueban varios nombres,
+        # y solo se acepta una columna que tenga montos en pesos (no porcentajes).
+        for patron in ("pension reajustada", "monto pension", "pension mensual", "pension"):
+            for idx, celda in enumerate(encabezado):
+                if patron not in celda or "%" in celda:
+                    continue
+                if any(es_monto_pesos(fila[idx]) for fila in detalle if len(fila) > idx):
+                    return idx
+        # Sin encabezado usable: la columna de pesos que viene justo después de una de porcentaje.
+        for idx in range(1, len(filas[0])):
+            anteriores = [fila[idx - 1] for fila in detalle if len(fila) > idx]
+            actuales = [fila[idx] for fila in detalle if len(fila) > idx]
+            if any("%" in v for v in anteriores) and any(es_monto_pesos(v) for v in actuales):
+                return idx
+        return None
+
+    def ultima_pension_de_tabla(filas):
+        idx = indice_columna_pension(filas)
+        if idx is None:
+            return ""
+        ultimo = ""
+        for fila in filas[1:]:
+            celdas = [limpiar_texto(c) for c in fila]
+            if len(celdas) <= idx or es_fila_resumen(celdas):
+                continue
+            if es_monto_pesos(celdas[idx]):
+                ultimo = celdas[idx]
+        return ultimo
 
     try:
         import fitz
@@ -457,51 +499,25 @@ def extraer_datos_liquidacion_desde_pdf(pdf_path):
                 if not filas:
                     continue
 
-                encabezado = [normalizar_comparacion(c) for c in filas[0] if c]
-                idx_pension = None
-                idx_total = None
-                if any("pension reajustada" in c for c in encabezado):
-                    for idx, celda in enumerate(encabezado):
-                        if "pension reajustada" in celda:
-                            idx_pension = idx
-                        if celda == "total":
-                            idx_total = idx
+                if not datos["monto_pen"]:
+                    ultima_pension = ultima_pension_de_tabla(filas)
+                    if ultima_pension:
+                        datos["monto_pen"] = normalizar_monto(ultima_pension)
 
-                    ultimo_monto_pension = ""
-                    for fila in filas[1:]:
-                        celdas = [limpiar_texto(c) for c in fila]
-                        fila_norm = " | ".join(normalizar_comparacion(c) for c in celdas if c)
+                for fila in filas:
+                    celdas = [limpiar_texto(c) for c in fila]
+                    fila_norm = " | ".join(normalizar_comparacion(c) for c in celdas if c)
 
-                        if not datos["cuenta_lav"] and "cuenta lav" in fila_norm:
-                            for celda in celdas:
-                                m_lav = re.search(r"\b([0-9]{6,})\b", celda)
-                                if m_lav:
-                                    datos["cuenta_lav"] = m_lav.group(1)
-                                    break
-
-                        if "total liquidacion de deuda" in fila_norm and celdas:
-                            datos["total_liq"] = normalizar_monto(celdas[-1])
-
-                        if idx_pension is not None and len(celdas) > idx_pension:
-                            valor_pension = limpiar_texto(celdas[idx_pension])
-                            if valor_pension and valor_pension != "-":
-                                ultimo_monto_pension = valor_pension
-
-                    if ultimo_monto_pension:
-                        datos["monto_pen"] = normalizar_monto(ultimo_monto_pension)
-
-                # Captura de LAV desde tablas de resumen que no son la de detalle.
-                if not datos["cuenta_lav"]:
-                    fila_completa = " | ".join(normalizar_comparacion(c) for c in filas[0] if c)
-                    if "cuenta lav" in fila_completa:
-                        for fila in filas:
-                            for celda in fila:
-                                m_lav = re.search(r"\b([0-9]{6,})\b", limpiar_texto(celda))
-                                if m_lav:
-                                    datos["cuenta_lav"] = m_lav.group(1)
-                                    break
-                            if datos["cuenta_lav"]:
+                    if not datos["cuenta_lav"] and "cuenta lav" in fila_norm:
+                        for celda in celdas:
+                            m_lav = re.search(r"\b([0-9]{6,})\b", celda)
+                            if m_lav:
+                                datos["cuenta_lav"] = m_lav.group(1)
                                 break
+
+                    if not datos["total_liq"] and "total liquidacion de deuda" in fila_norm:
+                        valores = [c for c in celdas if c]
+                        datos["total_liq"] = normalizar_monto(valores[-1])
 
         # Fallback por texto plano si la tabla no entrego los datos esperados.
         if not datos["total_liq"] or not datos["monto_pen"] or not datos["cuenta_lav"]:
@@ -525,43 +541,6 @@ def extraer_datos_liquidacion_desde_pdf(pdf_path):
                     )
                     if m:
                         datos["cuenta_lav"] = m.group(1)
-
-        # Si el PDF viene como tabla, aseguramos que el ultimo monto de pension reajustada
-        # sea el ultimo valor visible de esa columna.
-        if not datos["monto_pen"]:
-            try:
-                ultima_pension = ""
-                for pagina in fitz.open(pdf_path):
-                    try:
-                        tablas = pagina.find_tables()
-                    except Exception:
-                        continue
-                    for tabla in tablas.tables:
-                        try:
-                            filas = tabla.extract()
-                        except Exception:
-                            continue
-                        if not filas:
-                            continue
-                        encabezado = [limpiar_texto(c).lower() for c in filas[0]]
-                        if "pension reajustada" not in " | ".join(encabezado):
-                            continue
-                        idx_pension = None
-                        for idx, celda in enumerate(encabezado):
-                            if "pension reajustada" in celda:
-                                idx_pension = idx
-                                break
-                        if idx_pension is None:
-                            continue
-                        for fila in filas[1:]:
-                            if len(fila) > idx_pension:
-                                valor = limpiar_texto(fila[idx_pension])
-                                if valor and valor != "-":
-                                    ultima_pension = valor
-                if ultima_pension:
-                    datos["monto_pen"] = normalizar_monto(ultima_pension)
-            except Exception as e:
-                print(f"    [PDF] Error en fallback de pension reajustada: {e}")
 
         # Total de liquidacion: priorizar la fila total de deuda
         if not datos["total_liq"]:
@@ -601,7 +580,7 @@ def cerrar_popups_ie_background():
         def callback(hwnd, _):
             if win32gui.IsWindowVisible(hwnd):
                 title = win32gui.GetWindowText(hwnd)
-                if "Mensaje de la pÃ¡gina web" in title or "Internet Explorer" in title:
+                if "Mensaje de la página web" in title or "Internet Explorer" in title:
                     win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
                     win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
                     #print(f"DEBUG: Pop-up '{title}' cerrado.")
@@ -639,7 +618,7 @@ def obtener_body_frame(ie):
     try:
         doc = ie.Document
         
-        # 1. Â¿EstÃ¡n los elementos directamente en la pÃ¡gina principal?
+        # 1. ¿Están los elementos directamente en la página principal?
         try:
             if doc.getElementsByName("TIP_Causa").length > 0:
                 return ie  # Devolver la ventana principal
@@ -660,7 +639,7 @@ def obtener_body_frame(ie):
                                     return nodo.contentWindow
                             except: pass
                             
-                            # Intentar obtenerlo mediante la colecciÃ³n COM
+                            # Intentar obtenerlo mediante la colección COM
                             try:
                                 return doc.frames(i)
                             except: pass
@@ -670,7 +649,7 @@ def obtener_body_frame(ie):
             except Exception as e1:
                 print(f"    [DEBUG] Error buscando <{tag}>: {e1}")
 
-        # 3. IteraciÃ³n clÃ¡sica de la colecciÃ³n frames
+        # 3. Iteración clásica de la colección frames
         try:
             frames = doc.frames
             length = getattr(frames, 'length', 0)
@@ -697,7 +676,7 @@ def obtener_body_frame(ie):
     except Exception as e:
         print(f"    [DEBUG] Error general en obtener_body_frame: {e}")
     
-    print("    [DEBUG] No se encontrÃ³ el frame 'body' y tampoco estaban los elementos en la pÃ¡gina principal.")
+    print("    [DEBUG] No se encontró el frame 'body' y tampoco estaban los elementos en la página principal.")
     return None
 
 def agregar_nomenclatura(doc, valor_nomenclatura):
@@ -715,7 +694,7 @@ def agregar_nomenclatura(doc, valor_nomenclatura):
     return False
 
 def normalizar_texto(valor):
-    """Deja el texto en minÃºsculas, sin tildes y con espacios limpios."""
+    """Deja el texto en minúsculas, sin tildes y con espacios limpios."""
     if valor is None:
         return ""
     texto = str(valor).strip().lower()
@@ -978,7 +957,7 @@ def formatear_total_liquidacion(valor):
         return str(valor).strip()
 
 def limpiar_separadores_numericos(valor):
-    """Deja un valor numÃ©rico sin separadores de miles ni sÃ­mbolos de moneda."""
+    """Deja un valor numérico sin separadores de miles ni símbolos de moneda."""
     if valor is None:
         return ""
     texto = str(valor).strip()
@@ -987,7 +966,7 @@ def limpiar_separadores_numericos(valor):
     return texto.replace("$", "").replace(".", "").replace(",", "").replace(" ", "")
 
 def eliminar_filas_con_variables_pendientes(doc_word):
-    """Elimina filas de tablas que todavÃ­a contienen variables sin reemplazar."""
+    """Elimina filas de tablas que todavía contienen variables sin reemplazar."""
     try:
         tablas = getattr(doc_word, "Tables", None)
         if not tablas:
@@ -1023,7 +1002,7 @@ def eliminar_filas_con_variables_pendientes(doc_word):
         return 0
 
 def limpiar_pdfs_en_carpeta(ruta_carpeta):
-    """Elimina los PDFs existentes para dejar la carpeta lista para una nueva iteraciÃ³n."""
+    """Elimina los PDFs existentes para dejar la carpeta lista para una nueva iteración."""
     eliminados = 0
     try:
         if not ruta_carpeta or not os.path.isdir(ruta_carpeta):
@@ -1041,17 +1020,17 @@ def limpiar_pdfs_en_carpeta(ruta_carpeta):
     return eliminados
 
 def esperar_pdf_unico_en_carpeta(ruta_carpeta, timeout_segundos=60):
-    """Espera hasta encontrar un Ãºnico PDF en la carpeta."""
+    """Espera hasta encontrar un único PDF en la carpeta."""
     if not ruta_carpeta or not os.path.isdir(ruta_carpeta):
       return ""
 
 def pedir_confirmacion_pdf_descargado():
-    """Pregunta al usuario si el PDF ya se descargÃ³."""
+    """Pregunta al usuario si el PDF ya se descargó."""
     return messagebox.askyesno(
         "PDF descargado",
-        "Â¿Ya se descargÃ³ el PDF de la liquidaciÃ³n?\n\n"
-        "SÃ­: buscarÃ© un PDF en la carpeta seleccionada.\n"
-        "No: continuarÃ© sin autollenar los datos."
+        "¿Ya se descargó el PDF de la liquidación?\n\n"
+        "Sí: buscaré un PDF en la carpeta seleccionada.\n"
+        "No: continuaré sin autollenar los datos."
     )
 
     fin = time.time() + timeout_segundos
@@ -1073,7 +1052,7 @@ def pedir_confirmacion_pdf_descargado():
     return ""
 
 def clicar_pdf_liquidacion(ie, doc, id_escrito, reintentos=10, pausa=0.5):
-    """Busca y pulsa el botÃ³n de generar PDF asociado al id de la liquidaciÃ³n."""
+    """Busca y pulsa el botón de generar PDF asociado al id de la liquidación."""
     if not doc or not id_escrito:
         return False
 
@@ -1085,7 +1064,7 @@ def clicar_pdf_liquidacion(ie, doc, id_escrito, reintentos=10, pausa=0.5):
                 continue
 
             imagenes = doc.getElementsByTagName("img")
-            print(f"    [PDF] Intento {intento}: revisando {getattr(imagenes, 'length', 0)} imÃ¡genes para id '{id_escrito}'.")
+            print(f"    [PDF] Intento {intento}: revisando {getattr(imagenes, 'length', 0)} imágenes para id '{id_escrito}'.")
             for img in imagenes:
                 try:
                     src = str(getattr(img, "src", "")).lower()
@@ -1097,14 +1076,14 @@ def clicar_pdf_liquidacion(ie, doc, id_escrito, reintentos=10, pausa=0.5):
                 except Exception:
                     continue
         except Exception as e:
-            print(f"    [PDF] Error buscando botÃ³n de PDF: {e}")
+            print(f"    [PDF] Error buscando botón de PDF: {e}")
         time.sleep(pausa)
 
-    print(f"    [PDF] No se encontrÃ³ el botÃ³n de PDF para id '{id_escrito}'.")
+    print(f"    [PDF] No se encontró el botón de PDF para id '{id_escrito}'.")
     return False
 
 def insertar_pdf_como_imagenes_en_word(doc_word, pdf_path):
-    """Convierte cada pÃ¡gina del PDF en imagen e inserta al final del documento de Word."""
+    """Convierte cada página del PDF en imagen e inserta al final del documento de Word."""
     try:
         import fitz
     except Exception as e:
@@ -1112,13 +1091,13 @@ def insertar_pdf_como_imagenes_en_word(doc_word, pdf_path):
         return False
 
     if not pdf_path or not os.path.exists(pdf_path):
-        print(f"    [Word] PDF no vÃ¡lido: {pdf_path}")
+        print(f"    [Word] PDF no válido: {pdf_path}")
         return False
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             pdf = fitz.open(pdf_path)
-            print(f"    [Word] PDF pÃ¡ginas detectadas: {len(pdf)}")
+            print(f"    [Word] PDF páginas detectadas: {len(pdf)}")
             selection = doc_word.Application.Selection
             try:
                 doc_word.Activate()
@@ -1145,7 +1124,7 @@ def insertar_pdf_como_imagenes_en_word(doc_word, pdf_path):
                         SaveWithDocument=True
                     )
                 except Exception as e_pic:
-                    print(f"    [Word] AddPicture fallÃ³ en pÃ¡gina {i}: {e_pic}")
+                    print(f"    [Word] AddPicture falló en página {i}: {e_pic}")
                     try:
                         rng = doc_word.Range(doc_word.Content.End - 1, doc_word.Content.End - 1)
                         rng.InlineShapes.AddPicture(
@@ -1154,17 +1133,17 @@ def insertar_pdf_como_imagenes_en_word(doc_word, pdf_path):
                             SaveWithDocument=True
                         )
                     except Exception as e_rng:
-                        print(f"    [Word] Fallback Range fallÃ³ en pÃ¡gina {i}: {e_rng}")
+                        print(f"    [Word] Fallback Range falló en página {i}: {e_rng}")
                         return False
                 if i < len(pdf) - 1:
                     try:
                         selection.TypeParagraph()
                     except Exception:
                         pass
-        print(f"    [Word] PDF insertado como imÃ¡genes al final del documento: {pdf_path}")
+        print(f"    [Word] PDF insertado como imágenes al final del documento: {pdf_path}")
         return True
     except Exception as e:
-        print(f"    [Word] Error insertando PDF como imÃ¡genes: {e}")
+        print(f"    [Word] Error insertando PDF como imágenes: {e}")
         return False
 
 # Variables globales para manejar el documento temporal
@@ -1182,7 +1161,7 @@ def cerrar_y_eliminar_word_temporal(cerrar_documento=False):
                 except Exception as e:
                     print(f"No se pudo cerrar el documento en Word: {e}")
             doc_abierto_actual = None
-            ruta_temp_actual = None # Limpiar tambiÃ©n la ruta
+            ruta_temp_actual = None # Limpiar también la ruta
     except Exception as e:
         print(f"Error general limpiando documento: {e}")
 
@@ -1281,22 +1260,28 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
     
     try:
         
-        # Determinar quÃ© plantilla usar
+        # Determinar qué plantilla usar
         if cuotas >= 3:
             ruta_doc_a_usar = ruta_plantilla_con_rd
         else:
             ruta_doc_a_usar = ruta_plantilla_sin_rd
 
         if not ruta_doc_a_usar or not os.path.exists(ruta_doc_a_usar):
-            print(f"No se encontrÃ³ el documento plantilla: {ruta_doc_a_usar}")
-            messagebox.showerror("Error", f"No se encontrÃ³ el documento plantilla: {ruta_doc_a_usar}")
+            print(f"No se encontró el documento plantilla: {ruta_doc_a_usar}")
+            messagebox.showerror("Error", f"No se encontró el documento plantilla: {ruta_doc_a_usar}")
             return False
 
         ruta_doc_a_usar = os.path.abspath(ruta_doc_a_usar)
         print(f"    [Word] Ruta confirmada: {ruta_doc_a_usar}")
 
-        print(f"    [Word] Abriendo plantilla: {ruta_doc_a_usar}")
-        os.startfile(ruta_doc_a_usar)
+        # Se trabaja con una copia de la plantilla: la original no se modifica y
+        # la copia no hereda la marca de "archivo de internet" que haría que Word
+        # abra el documento en Vista protegida.
+        import shutil
+        carpeta_copia = tempfile.mkdtemp(prefix="sitfa_word_")
+        ruta_copia = os.path.join(carpeta_copia, os.path.basename(ruta_doc_a_usar))
+        shutil.copyfile(ruta_doc_a_usar, ruta_copia)
+        print(f"    [Word] Abriendo copia de la plantilla: {ruta_copia}")
 
         try:
             word = win32com.client.GetActiveObject("Word.Application")
@@ -1309,19 +1294,23 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
         except Exception:
             pass
 
-        # Esperar a que Word termine de abrir la plantilla antes de editarla.
+        # Documents.Open devuelve el documento directamente, sin depender de
+        # ActiveDocument. Se reintenta si Word está ocupado (diálogo abierto).
         doc_word = None
-        for _ in range(30):
+        ultimo_error = None
+        for intento in range(1, 6):
             try:
-                doc_word = word.ActiveDocument
-                if doc_word and os.path.basename(getattr(doc_word, "FullName", "")).lower() == os.path.basename(ruta_doc_a_usar).lower():
-                    break
-            except Exception:
-                doc_word = None
-            time.sleep(0.5)
+                # FileName, ConfirmConversions, ReadOnly, AddToRecentFiles
+                doc_word = word.Documents.Open(ruta_copia, False, False, False)
+                break
+            except Exception as e_open:
+                ultimo_error = e_open
+                print(f"    [Word] Intento {intento} de abrir la plantilla falló: {e_open}")
+                time.sleep(1.5)
 
-        if not doc_word:
-            print("    [Word] No se pudo obtener el documento activo despuÃ©s de esperar la apertura.")
+        if doc_word is None:
+            print(f"    [Word] No se pudo abrir la plantilla en Word después de 5 intentos: {ultimo_error}")
+            print("    [Word] Revise que Word no tenga un cuadro de diálogo abierto y vuelva a intentarlo.")
             return False
 
         doc_word.Activate()
@@ -1332,7 +1321,7 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
             pass
         time.sleep(0.5)
         doc_abierto_actual = doc_word
-        ruta_temp_actual = ruta_doc_a_usar
+        ruta_temp_actual = ruta_copia
         
         # Debug: mostrar contenido del documento para ver qué marcadores hay
         try:
@@ -1368,13 +1357,21 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
                     reemplazos["<<rut dte>>"] = r
                     reemplazos["<<RUT DTE>>"] = r
                 elif s == "nino":
-                    reemplazos["<<NOMBRE NIÃ‘O>>"] = n
-                    reemplazos["<<rut niÃ±o>>"] = r
-                    reemplazos["<<RUT NIÃ‘O>>"] = r
+                    reemplazos["<<NOMBRE NIÑO>>"] = n
+                    reemplazos["<<rut niño>>"] = r
+                    reemplazos["<<RUT NIÑO>>"] = r
+                    # Alias Unicode correcto para plantillas guardadas con tildes.
+                    reemplazos["<<NOMBRE NI\u00d1O>>"] = n
+                    reemplazos["<<rut ni\u00f1o>>"] = r
+                    reemplazos["<<RUT NI\u00d1O>>"] = r
                 elif s == "nina":
-                    reemplazos["<<NOMBRE NIÃ‘A>>"] = n
-                    reemplazos["<<rut niÃ±a>>"] = r
-                    reemplazos["<<RUT NIÃ‘A>>"] = r
+                    reemplazos["<<NOMBRE NIÑA>>"] = n
+                    reemplazos["<<rut niña>>"] = r
+                    reemplazos["<<RUT NIÑA>>"] = r
+                    # Alias Unicode correcto para plantillas guardadas con tildes.
+                    reemplazos["<<NOMBRE NI\u00d1A>>"] = n
+                    reemplazos["<<rut ni\u00f1a>>"] = r
+                    reemplazos["<<RUT NI\u00d1A>>"] = r
                 elif s == "adolescente" or s == "nna":
                     reemplazos["<<NOMBRE NNA>>"] = n
                     reemplazos["<<rut nna>>"] = r
@@ -1385,14 +1382,14 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
                     reemplazos["<<RUT SOLICITANTE>>"] = r
 
         # Compatibilidad limpia para plantillas sin tildes.
-        if "<<NOMBRE NIÃƒâ€˜O>>" in reemplazos and "<<NOMBRE NINO>>" not in reemplazos:
-            reemplazos["<<NOMBRE NINO>>"] = reemplazos["<<NOMBRE NIÃƒâ€˜O>>"]
-            reemplazos["<<rut nino>>"] = reemplazos.get("<<rut niÃƒÂ±o>>", reemplazos.get("<<RUT NIÃƒâ€˜O>>", ""))
-            reemplazos["<<RUT NINO>>"] = reemplazos.get("<<RUT NIÃƒâ€˜O>>", reemplazos.get("<<rut niÃƒÂ±o>>", ""))
-        if "<<NOMBRE NIÃƒâ€˜A>>" in reemplazos and "<<NOMBRE NINA>>" not in reemplazos:
-            reemplazos["<<NOMBRE NINA>>"] = reemplazos["<<NOMBRE NIÃƒâ€˜A>>"]
-            reemplazos["<<rut nina>>"] = reemplazos.get("<<rut niÃƒÂ±a>>", reemplazos.get("<<RUT NIÃƒâ€˜A>>", ""))
-            reemplazos["<<RUT NINA>>"] = reemplazos.get("<<RUT NIÃƒâ€˜A>>", reemplazos.get("<<rut niÃƒÂ±a>>", ""))
+        if "<<NOMBRE NIÑO>>" in reemplazos and "<<NOMBRE NINO>>" not in reemplazos:
+            reemplazos["<<NOMBRE NINO>>"] = reemplazos["<<NOMBRE NIÑO>>"]
+            reemplazos["<<rut nino>>"] = reemplazos.get("<<rut niño>>", reemplazos.get("<<RUT NIÑO>>", ""))
+            reemplazos["<<RUT NINO>>"] = reemplazos.get("<<RUT NIÑO>>", reemplazos.get("<<rut niño>>", ""))
+        if "<<NOMBRE NIÑA>>" in reemplazos and "<<NOMBRE NINA>>" not in reemplazos:
+            reemplazos["<<NOMBRE NINA>>"] = reemplazos["<<NOMBRE NIÑA>>"]
+            reemplazos["<<rut nina>>"] = reemplazos.get("<<rut niña>>", reemplazos.get("<<RUT NIÑA>>", ""))
+            reemplazos["<<RUT NINA>>"] = reemplazos.get("<<RUT NIÑA>>", reemplazos.get("<<rut niña>>", ""))
         if "<<NOMBRE NNA>>" in reemplazos and "<<NOMBRE NNA>>" not in reemplazos:
             pass
 
@@ -1401,7 +1398,7 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
             fecha_val = datos_resolucion.get("fecha")
             rit_val = datos_resolucion.get("rit")
             
-            # Criterio: Si hay folio (nÃºmero), usarlo. Si no, usar la fecha en su lugar.
+            # Criterio: Si hay folio (número), usarlo. Si no, usar la fecha en su lugar.
             valor_para_folio = folio_val if folio_val else fecha_val
             
             if valor_para_folio:
@@ -1472,9 +1469,9 @@ def modificar_word_abierto(texto, cuotas, datos_litigantes=None, datos_resolucio
         filas_eliminadas = eliminar_filas_con_variables_pendientes(doc_word)
         print(f"    [Word] Filas eliminadas por variables pendientes: {filas_eliminadas}")
         print("--- FIN REEMPLAZO EN WORD ---\n")
-        print("    [Word] Documento listo para revisiÃ³n manual.")
+        print("    [Word] Documento listo para revisión manual.")
 
-        print("    [Word] Cambios aplicados en memoria. No se guardÃ³ el archivo.")
+        print("    [Word] Cambios aplicados en memoria. No se guardó el archivo.")
         return True
     except Exception as e:
         print(f"Error modificando word: {e}")
@@ -1501,14 +1498,17 @@ def leer_excel_causas(ruta_archivo):
     return datos
 
 
-def preparar_causas_con_jueces(causas, jueces=None):
-    """Asocia cada RIT al juez cuyo índice coincide con el último dígito del rol."""
-    if jueces is None:
+def preparar_causas_con_jueces(causas, jueces=None, juez_unico=None):
+    """Asocia cada RIT a un juez.
+
+    Si juez_unico está activo ({"nombre": ..., "anio_hasta": ...}), las causas con año
+    igual o anterior a anio_hasta se asignan a ese juez. El resto usa el índice cuyo
+    número coincide con el último dígito del rol.
+    """
+    if jueces is None and juez_unico is None:
         return causas or []
 
-    nombres = [str(juez or "").strip() for juez in jueces]
-    if len(nombres) != 10:
-        raise ValueError("Se requieren exactamente 10 jueces, indexados del 0 al 9.")
+    nombres = [str(juez or "").strip() for juez in jueces or []]
 
     resultado = []
     for causa in causas or []:
@@ -1516,6 +1516,12 @@ def preparar_causas_con_jueces(causas, jueces=None):
         partes = rit.split("-")
         if len(partes) < 2 or not partes[1].strip() or not partes[1].strip()[-1].isdigit():
             raise ValueError(f"RIT inválido o sin rol numérico: {rit}")
+        anio = int(partes[2]) if len(partes) > 2 and partes[2].strip().isdigit() else None
+        if juez_unico and anio is not None and anio <= juez_unico["anio_hasta"]:
+            resultado.append({"rit": rit, "juez": juez_unico["nombre"]})
+            continue
+        if len(nombres) != 10:
+            raise ValueError("Se requieren exactamente 10 jueces, indexados del 0 al 9.")
         indice_juez = int(partes[1].strip()[-1])
         resultado.append({"rit": rit, "juez": nombres[indice_juez]})
     return resultado
@@ -2303,7 +2309,7 @@ def selenium_ir_al_buscador(driver):
         return False
 
 
-def automatizar_selenium_edge_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, jueces=None):
+def automatizar_selenium_edge_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, jueces=None, juez_unico=None):
     root = tk.Tk()
     root.withdraw()
 
@@ -2342,7 +2348,7 @@ def automatizar_selenium_edge_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, 
 
     if causas is None:
         causas = leer_excel_causas(archivo_excel)
-    causas = preparar_causas_con_jueces(causas, jueces)
+    causas = preparar_causas_con_jueces(causas, jueces, juez_unico)
     if not causas:
         messagebox.showerror("Error", "No se encontraron datos en el Excel.")
         return
@@ -2625,7 +2631,7 @@ def automatizar_selenium_edge_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, 
             except Exception:
                 pass
 
-def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, jueces=None):
+def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, jueces=None, juez_unico=None):
     root = tk.Tk()
     root.withdraw()
 
@@ -2635,9 +2641,9 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
         return
 
     if not carpeta_pdfs:
-        carpeta_pdfs = filedialog.askdirectory(title="Selecciona la carpeta donde se descargarÃ¡ el PDF")
+        carpeta_pdfs = filedialog.askdirectory(title="Selecciona la carpeta donde se descargará el PDF")
     if not carpeta_pdfs:
-        messagebox.showinfo("Cancelado", "No se seleccionÃ³ una carpeta para los PDF. Proceso terminado.")
+        messagebox.showinfo("Cancelado", "No se seleccionó una carpeta para los PDF. Proceso terminado.")
         return
 
     # --- Plantillas Word ---
@@ -2651,7 +2657,7 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
             filetypes=[("Word Documents", "*.doc *.docx")]
         )
         if not ruta_plantilla_con_rd:
-            messagebox.showinfo("Cancelado", "SelecciÃ³n de plantilla 'con RD' cancelada. Proceso terminado.")
+            messagebox.showinfo("Cancelado", "Selección de plantilla 'con RD' cancelada. Proceso terminado.")
             return
 
     if not ruta_plantilla_sin_rd:
@@ -2660,13 +2666,13 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
             filetypes=[("Word Documents", "*.doc *.docx")]
         )
         if not ruta_plantilla_sin_rd:
-            messagebox.showinfo("Cancelado", "SelecciÃ³n de plantilla 'sin RD' cancelada. Proceso terminado.")
+            messagebox.showinfo("Cancelado", "Selección de plantilla 'sin RD' cancelada. Proceso terminado.")
             return
     # -----------------------------------
 
     if causas is None:
         causas = leer_excel_causas(archivo_excel)
-    causas = preparar_causas_con_jueces(causas, jueces)
+    causas = preparar_causas_con_jueces(causas, jueces, juez_unico)
     if not causas:
         messagebox.showerror("Error", "No se encontraron datos en el Excel.")
         return
@@ -2679,7 +2685,7 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
                 ie = window
                 break
         if not ie:
-            messagebox.showerror("Error", "No se encontrÃ³ SITFA en IE.")
+            messagebox.showerror("Error", "No se encontró SITFA en IE.")
             return
         ie.Visible = 1
     except: return
@@ -2701,7 +2707,7 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
             continue
 
         try:
-            # A. BÃºsqueda inicial
+            # A. Búsqueda inicial
             body = obtener_body_frame(ie)
             doc = obtener_doc_seguro(body)
             if not doc:
@@ -2867,9 +2873,9 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
                 time.sleep(1.0)
                 clic_pdf = clicar_pdf_liquidacion(ie, doc, id_escrito, reintentos=12, pausa=0.5)
                 if not clic_pdf:
-                    print(f"[{rit_completo}] No se pudo disparar el PDF de la liquidaciÃ³n.")
+                    print(f"[{rit_completo}] No se pudo disparar el PDF de la liquidación.")
             
-            # D. DiÃ¡logo de cuotas
+            # D. Diálogo de cuotas
             datos_pdf = {"total_liq": "", "monto_pen": "", "cuenta_lav": ""}
             pdf_path = ""
             if pedir_confirmacion_pdf_descargado():
@@ -2884,24 +2890,24 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
                     print(f"[{rit_completo}] PDF detectado: {pdf_path}")
                     datos_pdf = extraer_datos_liquidacion_desde_pdf(pdf_path)
                     print(
-                        f"    [PDF] Datos extraÃ­dos -> total: {datos_pdf['total_liq']}, "
-                        f"monto pensiÃ³n: {datos_pdf['monto_pen']}, cuenta LAV: {datos_pdf['cuenta_lav']}"
+                        f"    [PDF] Datos extraídos -> total: {datos_pdf['total_liq']}, "
+                        f"monto pensión: {datos_pdf['monto_pen']}, cuenta LAV: {datos_pdf['cuenta_lav']}"
                     )
                 else:
-                    print(f"[{rit_completo}] El usuario confirmÃ³ PDF, pero no hay ninguno en la carpeta. Se mostrarÃ¡ el diÃ¡logo vacÃ­o.")
+                    print(f"[{rit_completo}] El usuario confirmó PDF, pero no hay ninguno en la carpeta. Se mostrará el diálogo vacío.")
             else:
-                print(f"[{rit_completo}] El usuario indicÃ³ que el PDF no estÃ¡ listo. Se continÃºa sin autollenado.")
+                print(f"[{rit_completo}] El usuario indicó que el PDF no está listo. Se continúa sin autollenado.")
 
             info = solicitar_datos_liquidacion(
                 root,
-                title="LiquidaciÃ³n",
+                title="Liquidación",
                 title_text=rit_completo,
                 initial_total_liq=datos_pdf.get("total_liq", ""),
                 initial_monto_pen=datos_pdf.get("monto_pen", ""),
                 initial_cuenta_lav=datos_pdf.get("cuenta_lav", "")
             )
             if not info:
-                print(f"[{rit_completo}] Se cancelÃ³ el diÃ¡logo de cuotas.")
+                print(f"[{rit_completo}] Se canceló el diálogo de cuotas.")
                 continue
             tipo, cuotas = info['tipo'], info['cuotas']
             total_liquidacion = info.get('total_liq', "")
@@ -2940,12 +2946,12 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
                 if refs.length > 0: campo_ref = refs[0]
             if campo_ref: campo_ref.value = texto_final
 
-            # RUC: intentar capturarlo desde la pÃ¡gina principal antes de abrir el popup de litigantes.
+            # RUC: intentar capturarlo desde la página principal antes de abrir el popup de litigantes.
             ruc_completo = extraer_ruc_desde_documento(doc)
             if ruc_completo:
-                print(f"    [DEBUG] RUC extraÃ­do desde pÃ¡gina principal: {ruc_completo}")
+                print(f"    [DEBUG] RUC extraído desde página principal: {ruc_completo}")
             else:
-                print("    [DEBUG] No se pudo extraer RUC desde la pÃ¡gina principal.")
+                print("    [DEBUG] No se pudo extraer RUC desde la página principal.")
 
             # --- OBTENER DATOS DE CABECERA (SUJETO, RUT, NOMBRE) ---
             print(f"\n--- EXTRAYENDO DATOS PARA {rit_completo} ---")
@@ -2987,7 +2993,7 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
                         except:
                             pass
                     if not ventana_popup:
-                        # Ãšltimo intento: encontrar cualquier pestaÃ±a cuyo tÃ­tulo mencione pop up.
+                        # Último intento: encontrar cualquier pestaña cuyo título mencione pop up.
                         for window in shell_windows:
                             try:
                                 if "iexplore.exe" in getattr(window, 'FullName', '').lower():
@@ -3005,7 +3011,7 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
                             print(f"    [DEBUG] readyState inicial popup: {d.readyState}")
                         except Exception:
                             pass
-                        # Ya no buscamos el RUC acÃ¡ salvo como respaldo si no se obtuvo antes.
+                        # Ya no buscamos el RUC acá salvo como respaldo si no se obtuvo antes.
                         if not ruc_completo:
                             try:
                                 ruc_popup = extraer_ruc_desde_documento(d)
@@ -3015,7 +3021,7 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
                             except Exception as e:
                                 print(f"Error al buscar RUC en ventana emergente: {e}")
 
-                        # Dump resumido del DOM para depurar quÃ© estÃ¡ leyendo realmente.
+                        # Dump resumido del DOM para depurar qué está leyendo realmente.
                         try:
                             all_tables_dbg = d.getElementsByTagName("table")
                             print(f"    [DEBUG] dump tables count: {getattr(all_tables_dbg, 'length', 0)}")
@@ -3067,7 +3073,7 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
                                     print(f"    [DEBUG] Error buscando en doc[{idx_doc}]: {e_doc}")
 
                             if not tabla:
-                                print("    [DEBUG] No se encontrÃ³ 'TablaLitigantes' en ningÃºn documento accesible.")
+                                print("    [DEBUG] No se encontró 'TablaLitigantes' en ningún documento accesible.")
                                 continue
 
                             print(f"    [DEBUG] total <tr> a revisar: {getattr(filas, 'length', 0)}")
@@ -3131,19 +3137,19 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
                         except Exception as e_fb:
                             print(f"Error en fallback de litigantes: {e_fb}")
                             
-                        # No cerrar la pestaÃ±a si es un tab compartido; solo liberar si realmente era una ventana separada.
+                        # No cerrar la pestaña si es un tab compartido; solo liberar si realmente era una ventana separada.
                         try:
                             if "popup" in str(getattr(ventana_popup, "LocationURL", "")).lower():
                                 ventana_popup.Quit()
                         except:
                             pass
                 else:
-                    print("No se encontrÃ³ el botÃ³n de ModificaciÃ³n.")
+                    print("No se encontró el botón de Modificación.")
                     
             except Exception as e_dbg:
-                print(f"Error en extracciÃ³n de cabecera: {e_dbg}")
+                print(f"Error en extracción de cabecera: {e_dbg}")
                 
-            # Mostrar los datos limpios extraÃ­dos
+            # Mostrar los datos limpios extraídos
             for litigante in datos_litigantes:
                 print(f" -> Encontrado: [{litigante['sujeto']}] RUT: {litigante['rut']} | Nombre: {litigante['nombre']}")
             print("------------------------------------------\n")
@@ -3221,12 +3227,13 @@ def automatizar_ie_con_rit(archivo_excel=None, carpeta_pdfs=None, causas=None, j
     messagebox.showinfo("Proceso Terminado", "El procesamiento por lotes ha finalizado.")
     cerrar_y_eliminar_word_temporal(cerrar_documento=False)
 
-def automatizar_con_backend(archivo_excel=None, carpeta_pdfs=None, causas=None, jueces=None):
+def automatizar_con_backend(archivo_excel=None, carpeta_pdfs=None, causas=None, jueces=None, juez_unico=None):
     automatizar_ie_con_rit(
         archivo_excel=archivo_excel,
         carpeta_pdfs=carpeta_pdfs,
         causas=causas,
         jueces=jueces,
+        juez_unico=juez_unico,
     )
 
 if __name__ == "__main__":
